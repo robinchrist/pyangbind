@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import types
+import typing
 import unittest
 
 TEST_PATH = os.path.dirname(os.path.abspath(__file__))
@@ -105,6 +106,50 @@ class DataclassDefaultsOnTests(unittest.TestCase):
     def test_defaults_satisfy_validation_on_init(self):
         # Constructing with only defaults must not raise.
         self.bindings.Dataclass()
+
+
+class DataclassReusableAliasTests(unittest.TestCase):
+    """Enum-typedef and identityref types are hoisted to module-level
+    `type X = typing.Literal[...]` aliases and referenced by name; inline
+    anonymous enums stay inlined."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bindings = generate()
+
+    def test_named_enum_typedef_hoisted(self):
+        # `typedef direction` -> module-level `Direction` alias.
+        self.assertTrue(hasattr(self.bindings, "Direction"))
+        self.assertEqual(
+            set(typing.get_args(self.bindings.Direction.__value__)), {"in", "out"}
+        )
+
+    def test_named_enum_typedef_deduped(self):
+        # dir-a and dir-b share the one alias, referenced by name. With
+        # `from __future__ import annotations` the annotation is the source
+        # string.
+        anns = self.bindings.Dataclass.Box.__annotations__
+        self.assertEqual(anns["dir_a"], "Direction | None")
+        self.assertEqual(anns["dir_b"], "Direction | None")
+
+    def test_identityref_aliased_by_base_identity(self):
+        self.assertTrue(hasattr(self.bindings, "Animal"))
+        values = set(typing.get_args(self.bindings.Animal.__value__))
+        # both bare and module-prefixed spellings of every derived identity
+        self.assertEqual(values, {"dog", "cat", "dc:dog", "dc:cat"})
+        self.assertEqual(self.bindings.Dataclass.Box.__annotations__["pet"], "Animal | None")
+
+    def test_inline_anonymous_enum_not_hoisted(self):
+        # `mood` is an inline enum: no module-level alias, inlined at the field.
+        self.assertFalse(hasattr(self.bindings, "Mood"))
+        self.assertEqual(
+            self.bindings.Dataclass.Box.__annotations__["mood"],
+            "typing.Literal['happy', 'sad'] | None",
+        )
+
+    def test_alias_does_not_shadow_a_tree_class(self):
+        # The module class name is reserved; aliases never collide with it.
+        self.assertTrue(isinstance(self.bindings.Dataclass, type))
 
 
 class DataclassNoDefaultsTests(unittest.TestCase):

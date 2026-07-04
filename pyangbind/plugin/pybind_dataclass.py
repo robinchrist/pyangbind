@@ -12,10 +12,15 @@ definitions with real type annotations:
                     fields of the entry)
 - leaf           -> ``<type> | None = None``
 - leaf-list      -> ``list[<type>]`` field
-- enumeration    -> ``typing.Literal['a', 'b', ...]``
-- identityref    -> ``typing.Literal[...]`` of every identity derived from
-                    the base, in both bare (``bgp``) and module-prefixed
-                    (``frr-bgp:bgp``) spelling
+- enumeration    -> ``typing.Literal['a', 'b', ...]``; when the enum comes
+                    from a named ``typedef`` it is hoisted to a module-level
+                    reusable ``type <TypedefName> = typing.Literal[...]`` alias
+                    (PEP 695, hence Python >= 3.12) referenced by name;
+                    inline anonymous enums stay inlined
+- identityref    -> a module-level ``type <BaseIdentity> = typing.Literal[...]``
+                    alias of every identity derived from the base, in both bare
+                    (``bgp``) and module-prefixed (``frr-bgp:bgp``) spelling;
+                    every leaf sharing the base identity references the one alias
 - union          -> ``T1 | T2`` of the mapped member types
 - bits           -> nested dataclass with one ``bool = False`` field per
                     YANG bit, truthy iff any bit is set (inside a union:
@@ -287,8 +292,9 @@ def safe_name(yang_name):
 
 
 def class_name(yang_name):
-    """YANG identifier -> Python class name (CamelCase)."""
-    parts = [p for p in re.split(r"[-._]", yang_name) if p]
+    """YANG identifier -> Python class name (CamelCase). Any module prefix
+    (``foo:bar``) is folded in like any other separator."""
+    parts = [p for p in re.split(r"[-._:]", yang_name) if p]
     name = "".join(p[:1].upper() + p[1:] for p in parts)
     if keyword.iskeyword(name):
         name += "_"
@@ -362,6 +368,29 @@ class _Emitter:
         self.with_defaults = with_defaults
         self.lines = []
         self.uses_decimal = False
+        # Module-level reusable types (Literal aliases and bits dataclasses),
+        # emitted once between the imports/runtime and the tree classes and
+        # referenced by name from every use site.
+        self.reusable_lines = []
+        self.reusable_by_key = {}  # dedup key -> assigned Python name
+        self.reusable_names = set()  # every assigned name, for collision avoidance
+
+    def _register_reusable(self, key, preferred_name, build_lines):
+        """Register (once) a module-level reusable type. `key` dedups repeated
+        requests for the same YANG type (e.g. an identity used by many leaves);
+        `build_lines(name)` returns the source lines for the chosen name.
+        Returns the Python name to reference it by."""
+        existing = self.reusable_by_key.get(key)
+        if existing is not None:
+            return existing
+        name = preferred_name
+        while name in self.reusable_names:
+            name += "_"
+        self.reusable_names.add(name)
+        self.reusable_by_key[key] = name
+        self.reusable_lines.extend(build_lines(name))
+        self.reusable_lines.append("")
+        return name
 
     # ---- type resolution ------------------------------------------------
 
@@ -399,10 +428,31 @@ class _Emitter:
             return "decimal.Decimal"
         if t.arg == "enumeration":
             values = [e.arg for e in t.search("enum")]
-            return self._literal(values) if values else "str"
+            if not values:
+                return "str"
+            # A named typedef gives a stable, reusable name; an inline
+            # (anonymous) enumeration has none, so it stays inlined.
+            typedef = getattr(type_stmt, "i_typedef", None)
+            if typedef is not None:
+                # typedef.arg is the bare typedef name; type_stmt.arg may be a
+                # prefixed cross-module reference (e.g. "frr-bt:as-type").
+                return self._register_literal_alias(
+                    ("typedef", id(typedef)), class_name(typedef.arg), values
+                )
+            return self._literal(values)
         if t.arg == "identityref":
             values = self._identityref_values(t)
-            return self._literal(values) if values else "str"
+            if not values:
+                return "str"
+            # identityrefs always have a natural name: their base identity.
+            # Every leaf sharing the base collapses onto one alias.
+            base = t.search_one("base")
+            identity = getattr(base, "i_identity", None) if base is not None else None
+            if identity is not None:
+                return self._register_literal_alias(
+                    ("identity", id(identity)), class_name(identity.arg), values
+                )
+            return self._literal(values)
         if t.arg == "union":
             members = []
             for member in t.search("type"):
@@ -439,6 +489,15 @@ class _Emitter:
     @staticmethod
     def _literal(values):
         return "typing.Literal[%s]" % ", ".join(repr(v) for v in values)
+
+    def _register_literal_alias(self, key, preferred_name, values):
+        """Emit `type <Name> = typing.Literal[...]` once at module level and
+        return <Name>. A PEP 695 type alias (pure alias, never constructed),
+        so the generated module requires Python >= 3.12."""
+        literal = self._literal(values)
+        return self._register_reusable(
+            key, preferred_name, lambda name: ["type %s = %s" % (name, literal)]
+        )
 
     # ---- validation check specs ----------------------------------------
 
@@ -739,6 +798,9 @@ def build_dataclasses(ctx, modules, fd, with_validation=True, with_defaults=True
     identity_values = _build_identity_values(ctx)
 
     emitter = _Emitter(ctx, identity_values, with_validation, with_defaults)
+    # Reserve the top-level module class names so a reusable type (emitted in
+    # the same module namespace) can never shadow one of them.
+    emitter.reusable_names.update(class_name(m.arg) for m in modules)
     emitted_any = False
     for module in modules:
         if not _Emitter._data_children(module):
@@ -769,6 +831,10 @@ def build_dataclasses(ctx, modules, fd, with_validation=True, with_defaults=True
         header.append(_VALIDATION_RUNTIME)
     header.extend(["", ""])
 
-    fd.write("\n".join(header + emitter.lines))
-    if not emitter.lines or emitter.lines[-1] != "":
+    # Reusable types (Literal aliases, bits dataclasses) go between the
+    # imports/runtime and the tree classes so forward references resolve and
+    # bits classes exist before they are used as field factory defaults.
+    body = emitter.reusable_lines + emitter.lines
+    fd.write("\n".join(header + body))
+    if not body or body[-1] != "":
         fd.write("\n")

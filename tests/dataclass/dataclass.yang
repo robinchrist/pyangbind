@@ -19,6 +19,21 @@ module dataclass {
     default 50;
   }
 
+  // A named enum typedef: used by >=2 leaves below, so it must be hoisted to
+  // one module-level `type Direction = Literal[...]` alias (deduped).
+  typedef direction {
+    type enumeration {
+      enum in;
+      enum out;
+    }
+  }
+
+  // identityref: aliased by its base identity name (Animal), covering every
+  // derived identity in bare and module-prefixed spelling.
+  identity animal;
+  identity dog { base animal; }
+  identity cat { base animal; }
+
   container box {
     leaf plain-before {
       type string;
@@ -55,6 +70,26 @@ module dataclass {
         bit gamma;
       }
       default "alpha gamma";
+    }
+    // Two leaves of the same named typedef -> one shared Direction alias.
+    leaf dir-a {
+      type direction;
+    }
+    leaf dir-b {
+      type direction;
+    }
+    // identityref -> Animal alias.
+    leaf pet {
+      type identityref {
+        base animal;
+      }
+    }
+    // Inline anonymous enum -> stays inlined, NOT hoisted to a module alias.
+    leaf mood {
+      type enumeration {
+        enum happy;
+        enum sad;
+      }
     }
     container nested-after-defaults {
       leaf inner-plain {
