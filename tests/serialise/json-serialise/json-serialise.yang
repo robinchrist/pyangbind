@@ -61,6 +61,20 @@ module json-serialise {
     }
   }
 
+  typedef bits1 {
+    type bits {
+      bit flag1 {
+	    position 1;
+	  }
+	  bit flag2 {
+	    position 2;
+	  }
+	  bit flag3 {
+	    position 3;
+	  }
+    }
+  }
+
   container c1 {
     list l1 {
       key "k1";
@@ -171,6 +185,9 @@ module json-serialise {
       leaf typedef-two {
         type definedtypeunion;
       }
+      leaf typedef-three {
+        type definedtypeunion;
+      }
 
       leaf-list ll {
         type string;
@@ -181,6 +198,7 @@ module json-serialise {
           type regexstring;
           type nhopenum;
           type string;
+          type bits1;
         }
       }
 
@@ -241,6 +259,13 @@ module json-serialise {
       leaf target {
         type string;
       }
+      leaf lol {
+        default "lol";
+        type string;
+      }
+      leaf bar {
+        type string;
+      }
     }
   }
 
@@ -249,4 +274,26 @@ module json-serialise {
       type string;
     }
   }
+
+   list interface {
+       key "name";
+       leaf name {
+         type string;
+       }
+       leaf admin-status {
+         type boolean;
+       }
+       list address {
+         key "ip";
+         leaf ip {
+           type string;
+         }
+       }
+     }
+
+     leaf mgmt-interface {
+       type leafref {
+         path "../interface/name";
+       }
+     }
 }

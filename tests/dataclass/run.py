@@ -23,10 +23,17 @@ BASE_DIR = os.path.dirname(os.path.dirname(TEST_PATH))
 PLUGIN_DIR = os.path.join(BASE_DIR, "pyangbind", "plugin")
 
 
-def generate(*flags, output_format="pybind-dataclass"):
+# The bits-in-union fixture lives with the serialise tests; reused here to
+# exercise a union whose members include a bits typedef.
+SERIALISE_DIR = os.path.join(BASE_DIR, "tests", "serialise", "json-serialise")
+
+
+def generate(*flags, output_format="pybind-dataclass", yang_file=None, search_path=None):
     pyang = shutil.which("pyang")
     if pyang is None:
         raise RuntimeError("Could not locate `pyang` executable.")
+    yang_file = yang_file or os.path.join(TEST_PATH, "dataclass.yang")
+    search_path = search_path or TEST_PATH
     cmd = [
         pyang,
         "--plugindir",
@@ -34,9 +41,9 @@ def generate(*flags, output_format="pybind-dataclass"):
         "-f",
         output_format,
         "-p",
-        TEST_PATH,
+        search_path,
         *flags,
-        os.path.join(TEST_PATH, "dataclass.yang"),
+        yang_file,
     ]
     code = subprocess.check_output(cmd, stderr=subprocess.PIPE, env={"PYTHONPATH": BASE_DIR})
     module = types.ModuleType("dataclass_bindings")
@@ -150,6 +157,51 @@ class DataclassReusableAliasTests(unittest.TestCase):
     def test_alias_does_not_shadow_a_tree_class(self):
         # The module class name is reserved; aliases never collide with it.
         self.assertTrue(isinstance(self.bindings.Dataclass, type))
+
+
+class DataclassBitsUnionTests(unittest.TestCase):
+    """bits become module-level reusable dataclasses, usable as union members
+    (previously they degraded to set[str]). Exercised via the json-serialise
+    fixture: `typedef bits1` appears both as a standalone leaf and inside a
+    union `str | nhopenum | bits1`."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bindings = generate(
+            yang_file=os.path.join(SERIALISE_DIR, "json-serialise.yang"),
+            search_path=SERIALISE_DIR,
+        )
+        cls.L1 = cls.bindings.JsonSerialise.C1.L1
+
+    def test_bits_hoisted_to_module_level(self):
+        self.assertTrue(isinstance(self.bindings.Bits1, type))
+        b = self.bindings.Bits1()
+        self.assertIs(b.flag1, False)
+        self.assertFalse(b)  # no bit set -> falsy
+        b.flag2 = True
+        self.assertTrue(b)
+
+    def test_bits_is_a_proper_union_member(self):
+        # The annotation is `list[str | Nhopenum | Bits1]`, not `... | set[str]`.
+        ann = self.L1.__annotations__["next_hop"]
+        self.assertIn("Bits1", ann)
+        self.assertNotIn("set[str]", ann)
+
+    def test_union_accepts_a_bits_instance(self):
+        entry = self.L1()
+        entry.next_hop = [self.bindings.Bits1(flag1=True)]  # validates on assignment
+        entry.next_hop = ["1.2.3.4"]  # a plain string member also validates
+
+    def test_union_rejects_value_matching_no_member(self):
+        entry = self.L1()
+        with self.assertRaises(self.bindings.YangValidationError):
+            entry.next_hop = [123]  # not str, not the enum, not a bits instance
+
+    def test_standalone_bits_leaf(self):
+        entry = self.L1()
+        self.assertIs(entry.bits.flag1, False)
+        with self.assertRaises(self.bindings.YangValidationError):
+            entry.bits.flag1 = "yes"  # bits fields are bools
 
 
 class DataclassNoDefaultsTests(unittest.TestCase):

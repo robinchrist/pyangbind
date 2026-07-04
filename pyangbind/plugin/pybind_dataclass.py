@@ -22,9 +22,12 @@ definitions with real type annotations:
                     (``bgp``) and module-prefixed (``frr-bgp:bgp``) spelling;
                     every leaf sharing the base identity references the one alias
 - union          -> ``T1 | T2`` of the mapped member types
-- bits           -> nested dataclass with one ``bool = False`` field per
-                    YANG bit, truthy iff any bit is set (inside a union:
-                    ``set[str]``, a union member cannot be a nested class)
+- bits           -> module-level reusable dataclass with one ``bool =
+                    False`` field per YANG bit, truthy iff any bit is set;
+                    hoisted (not nested) so it can also be a union member.
+                    The YANG default is applied at the field via a factory,
+                    not baked into the class, so one class is shared across
+                    leaves with differing defaults
 - choice/case    -> flattened into the parent (mutual exclusion of cases is
                     not enforced)
 
@@ -85,8 +88,9 @@ _SCALAR_TYPE_MAP = {
     # (or any truthy assignment) marks it present, `None` absent.
     "empty": "bool",
     "binary": "bytes",
-    # only reachable for bits inside a union; a bits *leaf* becomes a
-    # nested dataclass of bools instead (see _emit_bits_class)
+    # degenerate fallback only: a `bits` type with no `bit` statements.
+    # Real bits (leaf or union member) become a module-level reusable
+    # dataclass of bools instead (see _register_bits_class).
     "bits": "set[str]",
     "instance-identifier": "str",
 }
@@ -204,13 +208,18 @@ class _Check:
         elif base == "bytes":
             ok = isinstance(value, (bytes, bytearray))
         elif base == "bits":
-            ok = isinstance(value, (set, frozenset)) and all(
-                isinstance(bit, str) for bit in value
-            )
-            if ok and self.bits:
-                unknown = sorted(set(value) - set(self.bits))
-                if unknown:
-                    raise YangValidationError("%s: unknown bits %s" % (path, unknown))
+            if isinstance(value, _YangNode):
+                # A generated bits dataclass (e.g. a bits member of a union);
+                # it validates its own bool fields on assignment.
+                ok = True
+            else:
+                ok = isinstance(value, (set, frozenset)) and all(
+                    isinstance(bit, str) for bit in value
+                )
+                if ok and self.bits:
+                    unknown = sorted(set(value) - set(self.bits))
+                    if unknown:
+                        raise YangValidationError("%s: unknown bits %s" % (path, unknown))
         else:
             ok = True
         if not ok:
@@ -421,6 +430,10 @@ class _Emitter:
             return "str"
         t = self._resolve_typedef_chain(type_stmt)
 
+        if t.arg == "bits" and t.search("bit"):
+            # A module-level reusable bits dataclass (hoisted so it can be a
+            # union member too), referenced by name.
+            return self._register_bits_class(type_stmt, t, node)
         if t.arg in _SCALAR_TYPE_MAP:
             return _SCALAR_TYPE_MAP[t.arg]
         if t.arg == "decimal64":
@@ -656,54 +669,60 @@ class _Emitter:
             self.lines.append(("%s%s" % (indent, line)).rstrip())
         self.lines.append('%s"""' % indent)
 
-    def _emit_bits_class(self, node, resolved_type, cname, indent):
-        """A bits leaf becomes a nested dataclass with one bool per YANG
-        bit -- typo-proof and autocompleted, unlike a set[str]. The
-        instance is truthy iff any bit is set, preserving the
-        'falsy means not explicitly configured' contract. A YANG default
-        (e.g. 'alpha gamma') becomes True defaults on those bit fields.
-        Bits inside a *union* stay set[str] (a union member cannot be a
-        nested class)."""
-        self.lines.append("%s@dataclasses.dataclass" % indent)
-        base = "(_YangNode)" if self.with_validation else ""
-        self.lines.append("%sclass %s%s:" % (indent, cname, base))
-        body_indent = indent + "    "
-        self.lines.append(
-            '%s"""Bits `%s`: one bool per YANG bit; truthy iff any bit is set."""'
-            % (body_indent, node.arg)
-        )
+    def _register_bits_class(self, type_stmt, resolved_type, node):
+        """Register (once) a module-level dataclass for a bits type -- one
+        bool field per YANG bit, typo-proof and autocompleted (unlike a
+        set[str]), truthy iff any bit is set. Hoisted to module level (not
+        nested) so it can also be a *union* member. The YANG default is
+        applied at the field via a factory (see _bits_default_factory), not
+        baked into the class, so one class is shared by every leaf of the
+        type even when their defaults differ. Returns the class name."""
+        typedef = getattr(type_stmt, "i_typedef", None)
+        label = typedef.arg if typedef is not None else node.arg
+        preferred = class_name(typedef.arg if typedef is not None else node.arg)
+        bit_fnames = [safe_name(bit.arg) for bit in resolved_type.search("bit")]
 
-        default_bits = set()
-        if self.with_defaults and node.keyword == "leaf":
-            default_stmt = node.search_one("default")
-            for level in self._typedef_chain(node.search_one("type")):
-                if default_stmt is not None:
-                    break
-                typedef = getattr(level, "i_typedef", None)
-                if typedef is not None:
-                    default_stmt = typedef.search_one("default")
+        def build(name):
+            base = "(_YangNode)" if self.with_validation else ""
+            out = [
+                "@dataclasses.dataclass",
+                "class %s%s:" % (name, base),
+                '    """Bits `%s`: one bool per YANG bit; truthy iff any bit is set."""'
+                % label,
+            ]
+            out.extend("    %s: bool = False" % bit_fname for bit_fname in bit_fnames)
+            if self.with_validation:
+                out.append("")
+                out.append("    _field_checks = {")
+                out.extend("        %r: _Check('bool')," % bf for bf in bit_fnames)
+                out.append("    }")
+            out.append("")
+            out.append("    def __bool__(self) -> bool:")
+            out.append("        return any(vars(self).values())")
+            return out
+
+        # id(resolved_type) dedups across leaves sharing a typedef (they
+        # resolve to the same inner `type bits` statement) while staying
+        # unique per inline bits type.
+        return self._register_reusable(("bits", id(resolved_type)), preferred, build)
+
+    def _bits_default_factory(self, node, cname):
+        """Field `default_factory` expr for a bits leaf: the class itself, or
+        -- when defaults are enabled and a YANG default names bits -- a lambda
+        constructing it with those bits set True."""
+        if not self.with_defaults or node.keyword != "leaf":
+            return cname
+        default_stmt = node.search_one("default")
+        for level in self._typedef_chain(node.search_one("type")):
             if default_stmt is not None:
-                default_bits = set(default_stmt.arg.split())
-
-        bit_fields = []
-        for bit in resolved_type.search("bit"):
-            bit_fname = safe_name(bit.arg)
-            bit_fields.append(bit_fname)
-            self.lines.append(
-                "%s%s: bool = %s" % (body_indent, bit_fname, bit.arg in default_bits)
-            )
-
-        if self.with_validation:
-            self.lines.append("")
-            self.lines.append("%s_field_checks = {" % body_indent)
-            for bit_fname in bit_fields:
-                self.lines.append("%s    %r: _Check('bool')," % (body_indent, bit_fname))
-            self.lines.append("%s}" % body_indent)
-
-        self.lines.append("")
-        self.lines.append("%sdef __bool__(self) -> bool:" % body_indent)
-        self.lines.append("%s    return any(vars(self).values())" % body_indent)
-        self.lines.append("")
+                break
+            typedef = getattr(level, "i_typedef", None)
+            if typedef is not None:
+                default_stmt = typedef.search_one("default")
+        if default_stmt is None:
+            return cname
+        kwargs = ", ".join("%s=True" % safe_name(b) for b in default_stmt.arg.split())
+        return "lambda: %s(%s)" % (cname, kwargs)
 
     def _emit_leaf(self, child, fname, indent):
         ann = self.annotation(child.search_one("type"), child)
@@ -759,20 +778,19 @@ class _Emitter:
             else:  # leaf / leaf-list
                 resolved = self._resolve_typedef_chain(child.search_one("type"))
                 if resolved.arg == "bits" and resolved.search("bit"):
-                    child_cname = class_name(child.arg)
-                    while child_cname in used_class_names:
-                        child_cname += "_"
-                    used_class_names.add(child_cname)
-                    self._emit_bits_class(child, resolved, child_cname, body_indent)
+                    cname = self._register_bits_class(
+                        child.search_one("type"), resolved, child
+                    )
                     if child.keyword == "leaf-list":
                         self.lines.append(
                             "%s%s: list[%s] = dataclasses.field(default_factory=list)"
-                            % (body_indent, fname, child_cname)
+                            % (body_indent, fname, cname)
                         )
                     else:
+                        factory = self._bits_default_factory(child, cname)
                         self.lines.append(
                             "%s%s: %s = dataclasses.field(default_factory=%s)"
-                            % (body_indent, fname, child_cname, child_cname)
+                            % (body_indent, fname, cname, factory)
                         )
                     self.lines.append("")
                     continue
