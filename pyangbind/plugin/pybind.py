@@ -1321,7 +1321,7 @@ def build_elemtype(ctx, et, prefix=False):
             for bit in et.search("bit"):
                 position = bit.search_one("position")
                 if position is not None:
-                    pos = position.arg
+                    pos = int(position.arg)
                 else:
                     pos = 1 + max(allowed_bits.values(), default=-1)
                     if pos < 0 or 4294967295 < pos:
