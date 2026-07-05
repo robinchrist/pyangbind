@@ -56,6 +56,7 @@ def generate(*flags, output_format="pybind-dataclass", yang_file=None, search_pa
         exec(compile(code, "dataclass_bindings.py", "exec"), module.__dict__)
     finally:
         del sys.modules[module.__name__]
+    module._source = code.decode()
     return module
 
 
@@ -400,6 +401,43 @@ class DataclassValidateTreeTests(unittest.TestCase):
         refs.ratio = decimal.Decimal("1.25")
         with self.assertRaises(self.bindings.YangValidationError):
             refs.ratio = decimal.Decimal("1.256")
+
+
+class DataclassOriginCommentTests(unittest.TestCase):
+    """--dataclass-origin-comments: provenance comments on the line above
+    nodes contributed via uses/augment; locally-defined nodes stay bare."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bindings = generate("--dataclass-origin-comments")
+        cls.lines = cls.bindings._source.splitlines()
+
+    def _comment_above(self, needle):
+        for index, line in enumerate(self.lines):
+            if needle in line:
+                return self.lines[index - 1].strip()
+        self.fail("no generated line contains %r" % needle)
+
+    def test_uses_comment_above_field(self):
+        comment = self._comment_above("host: str | None")
+        self.assertRegex(comment, r"^# from dataclass\.yang:\d+, via uses endpoint at dataclass\.yang:\d+$")
+
+    def test_augment_comment_above_field(self):
+        comment = self._comment_above("augmented_note: str | None")
+        self.assertRegex(comment, r"^# from dataclass\.yang:\d+, via augment at dataclass\.yang:\d+$")
+
+    def test_local_nodes_stay_uncommented(self):
+        comment = self._comment_above("plain_before: str | None")
+        self.assertFalse(comment.startswith("# from"))
+
+    def test_module_still_executes_and_validates(self):
+        box = self.bindings.Dataclass.Box()
+        with self.assertRaises(self.bindings.YangValidationError):
+            box.number_with_default = 5
+
+    def test_off_by_default(self):
+        plain = generate()
+        self.assertNotIn("# from ", plain._source)
 
 
 class DataclassNoDefaultsTests(unittest.TestCase):

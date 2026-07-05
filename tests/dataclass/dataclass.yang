@@ -104,7 +104,16 @@ module dataclass {
   // Structural-constraint material: list keys/unique/max-elements,
   // mandatory, leafref, choice/case, min-elements. Consumed by the
   // metadata table and the validate_tree() whole-tree pass.
+  // Provenance material for --dataclass-origin-comments: a node pulled
+  // in via `uses` and one via `augment`.
+  grouping endpoint {
+    leaf host {
+      type string;
+    }
+  }
+
   container refs {
+    uses endpoint;
     list server {
       key "name";
       unique "port";
@@ -152,6 +161,12 @@ module dataclass {
           type uint16;
         }
       }
+    }
+  }
+
+  augment "/dc:refs" {
+    leaf augmented-note {
+      type string;
     }
   }
 }
