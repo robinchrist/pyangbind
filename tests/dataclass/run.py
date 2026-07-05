@@ -643,6 +643,94 @@ class DataclassNoValidationTests(unittest.TestCase):
         self.assertEqual(self.bindings.Dataclass.Box().with_default, "lol")
 
 
+class DataclassMustWhenTests(unittest.TestCase):
+    """validate_tree() evaluates YANG must/when constraints with the
+    embedded XPath 1.0 subset engine (dataclass-constraints.yang)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.yang = os.path.join(TEST_PATH, "dataclass-constraints.yang")
+        cls.bindings = generate(yang_file=cls.yang)
+
+    def setUp(self):
+        self.tree = self.bindings.DataclassConstraints()
+        self.Vrf = self.bindings.DataclassConstraints.Net.Vrf
+
+    def _violations(self):
+        try:
+            self.bindings.validate_tree(self.tree)
+        except self.bindings.YangValidationError as exc:
+            return str(exc)
+        return ""
+
+    def test_must_absolute_path_with_current(self):
+        self.tree.net.vrf = [
+            self.Vrf(name="u", role="underlay"),
+            self.Vrf(name="t", role="tenant", underlay_ref="u"),
+        ]
+        self.bindings.validate_tree(self.tree)
+        self.tree.net.vrf[1].underlay_ref = "t"  # tenant, not underlay
+        self.assertIn("underlay-ref must point at an underlay vrf", self._violations())
+
+    def test_must_relative_comparison(self):
+        self.tree.net.vrf = [self.Vrf(name="a", mtu=1500)]
+        self.bindings.validate_tree(self.tree)
+        self.tree.net.vrf[0].mtu = 100
+        self.assertIn("violates must", self._violations())
+
+    def test_must_count(self):
+        self.tree.net.members.member = ["x", "y"]
+        self.bindings.validate_tree(self.tree)
+        self.tree.net.members.member = ["x", "y", "z"]
+        self.assertIn("count(", self._violations())
+
+    def test_when_direct(self):
+        self.tree.net.vrf = [self.Vrf(name="a", enabled=True, detail="d")]
+        self.bindings.validate_tree(self.tree)
+        self.tree.net.vrf[0].enabled = False
+        self.assertIn("when condition", self._violations())
+
+    def test_when_absent_node_never_violates(self):
+        self.tree.net.vrf = [self.Vrf(name="a")]  # detail unset, when false
+        self.bindings.validate_tree(self.tree)
+
+    def test_when_on_choice_applies_to_flattened_fields(self):
+        self.tree.net.vrf = [self.Vrf(name="a", enabled=True, v4="10.0.0.1")]
+        self.bindings.validate_tree(self.tree)
+        self.tree.net.vrf[0].enabled = False
+        self.assertIn("when condition", self._violations())
+
+    def test_when_on_uses_has_parent_context(self):
+        self.tree.wrap.mode = "a"
+        self.tree.wrap.extra = "x"
+        self.bindings.validate_tree(self.tree)
+        self.tree.wrap.mode = "b"
+        self.assertIn("wrap/extra", self._violations())
+
+    def test_when_on_augment_has_parent_context(self):
+        self.tree.wrap.mode = "b"
+        self.tree.wrap.b_only = "x"
+        self.bindings.validate_tree(self.tree)
+        self.tree.wrap.mode = "a"
+        self.assertIn("wrap/b-only", self._violations())
+
+    def test_unsupported_expression_is_skipped_not_misjudged(self):
+        # re-match() is not implemented; the must on `odd` is filtered
+        # out at codegen, so any value passes
+        self.tree.net.vrf = [self.Vrf(name="a", odd="zzz")]
+        self.bindings.validate_tree(self.tree)
+        self.assertNotIn("re-match", self.bindings._source)
+
+    def test_opt_out_flag(self):
+        bindings = generate("--no-dataclass-must-when", yang_file=self.yang)
+        self.assertNotIn("musts=", bindings._source)
+        self.assertNotIn("whens=", bindings._source)
+        tree = bindings.DataclassConstraints()
+        Vrf = bindings.DataclassConstraints.Net.Vrf
+        tree.net.vrf = [Vrf(name="a", mtu=100)]  # violates the must
+        bindings.validate_tree(tree)  # ... which is not emitted
+
+
 class DataclassDumbTests(unittest.TestCase):
     """The feature-free pybind-dataclass-dumb variant shares the
     structural bits-as-dataclass-of-bools shape, without behavior."""

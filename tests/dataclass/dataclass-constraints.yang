@@ -1,0 +1,96 @@
+module dataclass-constraints {
+  yang-version 1.1;
+  namespace "http://pyangbind.example.com/dataclass-constraints";
+  prefix "dcc";
+
+  description
+    "Fixture for must/when evaluation in validate_tree: a representative
+     spread of the XPath subset (absolute paths with predicates and
+     current(), relative comparisons, count(), direct and inherited
+     when contexts) plus one deliberately unsupported expression that
+     must be skipped, never misjudged.";
+
+  container net {
+    list vrf {
+      key "name";
+      leaf name {
+        type string;
+      }
+      leaf role {
+        type enumeration {
+          enum underlay;
+          enum tenant;
+        }
+      }
+      leaf underlay-ref {
+        type leafref {
+          path "/dcc:net/dcc:vrf/dcc:name";
+        }
+        must "/dcc:net/dcc:vrf[dcc:name = current()]/dcc:role = 'underlay'" {
+          error-message "underlay-ref must point at an underlay vrf";
+        }
+      }
+      leaf mtu {
+        type uint16;
+        must ". >= 1280 and . <= 9216";
+      }
+      leaf enabled {
+        type boolean;
+      }
+      leaf detail {
+        type string;
+        when "../enabled = 'true'";
+      }
+      choice addr {
+        when "enabled = 'true'";
+        case v4 {
+          leaf v4 {
+            type string;
+          }
+        }
+        case v6 {
+          leaf v6 {
+            type string;
+          }
+        }
+      }
+      leaf odd {
+        type string;
+        // re-match() is outside the evaluated subset: filtered out at
+        // codegen, so this must can never fail (or pass) validation.
+        must "re-match(., 'a+')";
+      }
+    }
+    container members {
+      leaf-list member {
+        type string;
+        must "count(../dcc:member) <= 2";
+      }
+    }
+  }
+
+  grouping extras {
+    leaf extra {
+      type string;
+    }
+  }
+
+  container wrap {
+    leaf mode {
+      type enumeration {
+        enum a;
+        enum b;
+      }
+    }
+    uses extras {
+      when "mode = 'a'";
+    }
+  }
+
+  augment "/dcc:wrap" {
+    when "dcc:mode = 'b'";
+    leaf b-only {
+      type string;
+    }
+  }
+}

@@ -60,9 +60,25 @@ Validation (disable with ``--no-dataclass-validation``)
     re-validates every value, then checks leafref referential integrity
     (across all passed roots), mandatory leaves, list keys present and
     unique, ``unique`` groups, leaf-list value uniqueness, min-/max-
-    elements, and choice exclusivity / mandatory choices. All violations
-    are collected and raised as one ``YangValidationError``. ``must`` /
-    ``when`` are NOT evaluated (that would need an XPath engine).
+    elements, choice exclusivity / mandatory choices, and YANG ``must``
+    / ``when`` constraints. All violations are collected and raised as
+    one ``YangValidationError``.
+
+    ``must``/``when`` are evaluated by an XPath 1.0 subset engine
+    embedded in the generated runtime (location paths incl. ``..`` /
+    ``//`` / ``*``, predicates, comparisons with node-set semantics,
+    arithmetic, and/or, the core functions plus ``current()`` and an
+    exact-match ``derived-from-or-self()``). ``when`` context nodes
+    follow RFC 7950 7.21.5 (direct: the node itself; inherited from
+    uses/augment/choice/case: the parent), and prefixes are normalized
+    to module names at codegen. Expressions outside the subset --
+    explicit axes, variables, unimplemented functions, references to
+    modules not part of the codegen run, or identity derivation beyond
+    an exact match -- are skipped, never misjudged: filtered out of the
+    metadata at codegen where detectable, otherwise skipped at
+    evaluation time. Absolute paths resolve across all roots passed to
+    ``validate_tree``, so cross-module constraints require passing every
+    module root involved. Disable with ``--no-dataclass-must-when``.
 
 Defaults (disable with ``--no-dataclass-defaults``)
     YANG ``default`` statements (from the leaf itself or its typedef
@@ -203,6 +219,29 @@ _INT_BUILTIN_RANGE = {
 
 _DATA_KEYWORDS = ("container", "list", "leaf", "leaf-list", "choice")
 
+# XPath functions the embedded evaluator implements. must/when expressions
+# calling anything else are not emitted into the metadata at all (the
+# generated evaluator would raise _XPathUnsupported and skip them anyway;
+# filtering here keeps the generated tables honest about what is checked).
+_XPATH_SUPPORTED_FUNCTIONS = frozenset(
+    {
+        "boolean",
+        "concat",
+        "contains",
+        "count",
+        "current",
+        "derived-from",
+        "derived-from-or-self",
+        "false",
+        "not",
+        "number",
+        "starts-with",
+        "string",
+        "string-length",
+        "true",
+    }
+)
+
 # Runtime embedded whenever any generated feature needs per-field schema
 # metadata (validation today; serialisation and xpaths reuse the same
 # table). Stdlib-only, like everything embedded in the generated module.
@@ -227,6 +266,9 @@ class _FieldMeta:
     unique: tuple = ()  # list `unique` groups, tuples of field names
     leafref: str | None = None  # absolute schema path of the leafref target
     case: tuple | None = None  # (choice, case) of choice-flattened fields
+    # XPath constraints, evaluated by validate_tree where the node exists:
+    musts: tuple = ()  # ((expression, error-message | None), ...)
+    whens: tuple = ()  # ((expression, context-is-self), ...); False = parent
 
 
 def _qualified_name(meta, parent_module):
@@ -248,6 +290,553 @@ def _instance_key(entry, meta):
         yang_key = key_meta.yang_name if key_meta is not None else key
         parts.append("%s=%r" % (yang_key, getattr(entry, key, None)))
     return ",".join(parts)
+'''
+
+# XPath evaluator embedded alongside the validation runtime: evaluates the
+# YANG `must`/`when` expressions collected into _FieldMeta. A deliberate
+# XPath 1.0 subset (location paths incl. `..`/`//`/`*`, predicates,
+# comparisons, arithmetic, and/or, the core functions plus current() and
+# an exact-match derived-from-or-self()); expressions outside the subset
+# are filtered at codegen, and anything that still escapes evaluation
+# raises _XPathUnsupported at runtime and the constraint is skipped --
+# never misjudged. Stdlib-only, like everything embedded.
+_XPATH_EVAL_RUNTIME = r'''
+class _XPathUnsupported(Exception):
+    """The expression needs XPath outside the evaluated subset; the
+    surrounding must/when check is skipped rather than misjudged."""
+
+
+class _XNode:
+    """Instance node for XPath evaluation: a container / list entry, a
+    leaf value, or the document root joining all validate_tree roots.
+    Carries the parent pointer the plain dataclasses deliberately
+    don't."""
+
+    __slots__ = ("obj", "meta", "parent", "value", "is_leaf", "roots")
+
+    def __init__(self, obj, meta, parent, value=None, is_leaf=False, roots=None):
+        self.obj = obj
+        self.meta = meta
+        self.parent = parent
+        self.value = value
+        self.is_leaf = is_leaf
+        self.roots = roots  # document root only
+
+
+def _xnode_has_data(obj):
+    """YANG data-tree existence of a non-presence container instance."""
+    for fname, meta in getattr(type(obj), "_yang_fields", {}).items():
+        value = getattr(obj, fname, None)
+        if value is None:
+            continue
+        if meta.kind == "container":
+            if meta.presence or _xnode_has_data(value):
+                return True
+        elif isinstance(value, list):
+            if value:
+                return True
+        elif meta.cls is not None and isinstance(value, meta.cls):
+            if value:  # bits: exists iff any bit is set
+                return True
+        else:
+            return True
+    return False
+
+
+def _xnode_children(xnode):
+    if xnode.is_leaf:
+        return
+    holders = xnode.roots if xnode.roots is not None else [xnode.obj]
+    for holder in holders:
+        for fname, meta in getattr(type(holder), "_yang_fields", {}).items():
+            value = getattr(holder, fname, None)
+            if meta.kind == "container":
+                if value is not None and (meta.presence or _xnode_has_data(value)):
+                    yield _XNode(value, meta, xnode)
+            elif meta.kind == "list":
+                for entry in value or []:
+                    yield _XNode(entry, meta, xnode)
+            elif meta.kind == "leaf-list":
+                for element in value or []:
+                    yield _XNode(None, meta, xnode, value=element, is_leaf=True)
+            elif meta.cls is not None and isinstance(value, meta.cls):
+                if value:
+                    yield _XNode(None, meta, xnode, value=value, is_leaf=True)
+            elif value is not None:
+                yield _XNode(None, meta, xnode, value=value, is_leaf=True)
+
+
+def _xnode_string(xnode):
+    """XPath string-value of a node. Only leaves have one here: the
+    string-value of an interior node (concatenated descendant text) is
+    never useful in YANG constraints and is not modelled."""
+    if not xnode.is_leaf:
+        raise _XPathUnsupported("string-value of a non-leaf node")
+    meta, value = xnode.meta, xnode.value
+    if meta is not None and meta.encode == "empty":
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if meta is not None and meta.cls is not None and isinstance(value, meta.cls):
+        table = getattr(meta.cls, "_yang_fields", {})
+        return " ".join(m.yang_name for f, m in table.items() if getattr(value, f))
+    if isinstance(value, (set, frozenset)):
+        return " ".join(sorted(value))
+    if isinstance(value, float):
+        return _xpath_string(value)
+    return str(value)
+
+
+def _xnode_equals_string(xnode, text):
+    value = _xnode_string(xnode)
+    if xnode.meta is not None and xnode.meta.encode == "identityref":
+        # identityref spellings vary (bare / prefixed / module-qualified)
+        # and the bindings accept several -- compare local names
+        return value.split(":")[-1] == text.split(":")[-1]
+    return value == text
+
+
+_XPATH_TOKEN_RE = re.compile(
+    r"""
+      (?P<num>\d+(?:\.\d+)?|\.\d+)
+    | (?P<lit>"[^"]*"|'[^']*')
+    | (?P<op><=|>=|!=|//|[()\[\]|=<>+,*/-])
+    | (?P<dots>\.\.|\.)
+    | (?P<name>[A-Za-z_][\w.-]*(?::[A-Za-z_][\w.-]*)?)
+    """,
+    re.VERBOSE,
+)
+
+
+def _xpath_tokenize(text):
+    tokens, pos = [], 0
+    while pos < len(text):
+        if text[pos].isspace():
+            pos += 1
+            continue
+        match = _XPATH_TOKEN_RE.match(text, pos)
+        if match is None:
+            raise _XPathUnsupported("cannot tokenize %r" % text[pos:])
+        tokens.append((match.lastgroup, match.group()))
+        pos = match.end()
+    return tokens
+
+
+class _XPathParser:
+    """Recursive-descent XPath 1.0 (subset) parser producing a
+    nested-tuple AST. Anything outside the subset raises
+    _XPathUnsupported."""
+
+    def __init__(self, tokens):
+        self.tokens = tokens
+        self.pos = 0
+
+    def peek(self):
+        return self.tokens[self.pos] if self.pos < len(self.tokens) else (None, None)
+
+    def advance(self):
+        token = self.peek()
+        self.pos += 1
+        return token
+
+    def expect_op(self, text):
+        kind, value = self.advance()
+        if kind != "op" or value != text:
+            raise _XPathUnsupported("expected %r, got %r" % (text, value))
+
+    def parse(self):
+        ast = self.parse_or()
+        if self.pos != len(self.tokens):
+            raise _XPathUnsupported("trailing tokens %r" % (self.tokens[self.pos:],))
+        return ast
+
+    def parse_or(self):
+        left = self.parse_and()
+        while self.peek() == ("name", "or"):
+            self.advance()
+            left = ("or", left, self.parse_and())
+        return left
+
+    def parse_and(self):
+        left = self.parse_equality()
+        while self.peek() == ("name", "and"):
+            self.advance()
+            left = ("and", left, self.parse_equality())
+        return left
+
+    def parse_equality(self):
+        left = self.parse_relational()
+        while self.peek() in (("op", "="), ("op", "!=")):
+            left = ("cmp", self.advance()[1], left, self.parse_relational())
+        return left
+
+    def parse_relational(self):
+        left = self.parse_additive()
+        while self.peek() in (("op", "<"), ("op", "<="), ("op", ">"), ("op", ">=")):
+            left = ("cmp", self.advance()[1], left, self.parse_additive())
+        return left
+
+    def parse_additive(self):
+        left = self.parse_multiplicative()
+        while self.peek() in (("op", "+"), ("op", "-")):
+            left = ("arith", self.advance()[1], left, self.parse_multiplicative())
+        return left
+
+    def parse_multiplicative(self):
+        left = self.parse_unary()
+        # after a complete operand, `*` is multiplication, not a wildcard
+        while self.peek() in (("op", "*"), ("name", "div"), ("name", "mod")):
+            left = ("arith", self.advance()[1], left, self.parse_unary())
+        return left
+
+    def parse_unary(self):
+        if self.peek() == ("op", "-"):
+            self.advance()
+            return ("neg", self.parse_unary())
+        return self.parse_union()
+
+    def parse_union(self):
+        left = self.parse_path()
+        while self.peek() == ("op", "|"):
+            self.advance()
+            left = ("union", left, self.parse_path())
+        return left
+
+    def parse_path(self):
+        kind, value = self.peek()
+        if kind == "op" and value == "(":
+            self.advance()
+            inner = self.parse_or()
+            self.expect_op(")")
+            return self.parse_steps_after(("expr", inner))
+        if kind == "num":
+            self.advance()
+            return ("num", float(value))
+        if kind == "lit":
+            self.advance()
+            return ("lit", value[1:-1])
+        if (
+            kind == "name"
+            and self.pos + 1 < len(self.tokens)
+            and self.tokens[self.pos + 1] == ("op", "(")
+        ):
+            self.advance()
+            self.advance()
+            args = []
+            if self.peek() != ("op", ")"):
+                args.append(self.parse_or())
+                while self.peek() == ("op", ","):
+                    self.advance()
+                    args.append(self.parse_or())
+            self.expect_op(")")
+            return self.parse_steps_after(("call", value, tuple(args)))
+        # a location path
+        steps = []
+        start = "ctx"
+        if kind == "op" and value in ("/", "//"):
+            start = "root"
+            self.advance()
+            if value == "//":
+                steps.append(("descendant-or-self", None, ()))
+            elif not self.at_step():
+                return ("path", ("root",), ())  # bare '/'
+        steps.append(self.parse_step())
+        while self.peek() in (("op", "/"), ("op", "//")):
+            if self.advance()[1] == "//":
+                steps.append(("descendant-or-self", None, ()))
+            steps.append(self.parse_step())
+        return ("path", (start,), tuple(steps))
+
+    def parse_steps_after(self, primary):
+        """Predicates and an optional trailing location path after a
+        primary expression, e.g. current()/../vrf."""
+        predicates = []
+        while self.peek() == ("op", "["):
+            self.advance()
+            predicates.append(self.parse_or())
+            self.expect_op("]")
+        steps = []
+        while self.peek() in (("op", "/"), ("op", "//")):
+            if self.advance()[1] == "//":
+                steps.append(("descendant-or-self", None, ()))
+            steps.append(self.parse_step())
+        if not predicates and not steps:
+            return primary[1] if primary[0] == "expr" else primary
+        return ("path", ("filter", primary, tuple(predicates)), tuple(steps))
+
+    def at_step(self):
+        kind, value = self.peek()
+        return kind in ("name", "dots") or (kind == "op" and value == "*")
+
+    def parse_step(self):
+        kind, value = self.advance()
+        if kind == "dots":
+            axis, test = ("parent" if value == ".." else "self"), None
+        elif kind == "op" and value == "*":
+            axis, test = "child", "*"
+        elif kind == "name":
+            if self.peek() == ("op", "("):
+                raise _XPathUnsupported("node-type test %s()" % value)
+            axis, test = "child", value
+        else:
+            raise _XPathUnsupported("unexpected %r in a path" % (value,))
+        predicates = []
+        while self.peek() == ("op", "["):
+            self.advance()
+            predicates.append(self.parse_or())
+            self.expect_op("]")
+        return (axis, test, tuple(predicates))
+
+
+def _xpath_bool(value):
+    if isinstance(value, list):
+        return bool(value)
+    if isinstance(value, float):
+        return value == value and value != 0.0
+    return bool(value)
+
+
+def _xpath_number(value):
+    if isinstance(value, list):
+        value = _xpath_string(value)
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    if isinstance(value, float):
+        return value
+    try:
+        return float(value.strip())
+    except (ValueError, AttributeError):
+        return float("nan")
+
+
+def _xpath_string(value):
+    if isinstance(value, list):
+        return _xnode_string(value[0]) if value else ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float):
+        if value != value:
+            return "NaN"
+        try:
+            if value == int(value):
+                return str(int(value))
+        except (OverflowError, ValueError):
+            pass
+        return repr(value)
+    return value
+
+
+def _xpath_name_match(test, meta):
+    if meta is None:
+        return False
+    if test == "*":
+        return True
+    if ":" in test:
+        module, _, name = test.partition(":")
+        return meta.module == module and meta.yang_name == name
+    return meta.yang_name == test
+
+
+def _xpath_axis(nodes, axis, test):
+    out = []
+    if axis == "child":
+        for node in nodes:
+            for child in _xnode_children(node):
+                if _xpath_name_match(test, child.meta):
+                    out.append(child)
+    elif axis == "parent":
+        for node in nodes:
+            if node.parent is not None and node.parent not in out:
+                out.append(node.parent)
+    elif axis == "self":
+        out = list(nodes)
+    else:  # descendant-or-self
+        stack = list(nodes)
+        while stack:
+            node = stack.pop(0)
+            if node not in out:
+                out.append(node)
+                stack.extend(_xnode_children(node))
+    return out
+
+
+def _xpath_filter(nodes, predicate, env):
+    kept = []
+    for index, node in enumerate(nodes):
+        result = _xpath_eval(predicate, node, env)
+        if isinstance(result, float):
+            keep = (index + 1) == result  # positional predicate
+        else:
+            keep = _xpath_bool(result)
+        if keep:
+            kept.append(node)
+    return kept
+
+
+def _xpath_compare_atoms(op, a, b):
+    if op in ("=", "!="):
+        if isinstance(a, bool) or isinstance(b, bool):
+            a, b = _xpath_bool(a), _xpath_bool(b)
+        elif isinstance(a, float) or isinstance(b, float):
+            a, b = _xpath_number(a), _xpath_number(b)
+        return (a == b) if op == "=" else (a != b)
+    a, b = _xpath_number(a), _xpath_number(b)
+    if a != a or b != b:  # NaN never compares
+        return False
+    if op == "<":
+        return a < b
+    if op == "<=":
+        return a <= b
+    if op == ">":
+        return a > b
+    return a >= b
+
+
+def _xpath_compare(op, left, right):
+    left_ns, right_ns = isinstance(left, list), isinstance(right, list)
+    if left_ns and right_ns:
+        return any(
+            _xpath_compare_atoms(op, _xnode_string(a), _xnode_string(b))
+            for a in left
+            for b in right
+        )
+    if left_ns or right_ns:
+        nodes, other = (left, right) if left_ns else (right, left)
+        flip = not left_ns  # relational ops are not symmetric
+        if isinstance(other, bool):
+            a, b = bool(nodes), other
+            return _xpath_compare_atoms(op, b, a) if flip else _xpath_compare_atoms(op, a, b)
+        for node in nodes:
+            if op in ("=", "!=") and isinstance(other, str):
+                equal = _xnode_equals_string(node, other)
+                if (equal if op == "=" else not equal):
+                    return True
+            else:
+                a, b = _xnode_string(node), other
+                if _xpath_compare_atoms(op, b, a) if flip else _xpath_compare_atoms(op, a, b):
+                    return True
+        return False
+    return _xpath_compare_atoms(op, left, right)
+
+
+def _xpath_call(name, args, ctx, env):
+    if name == "current":
+        return [env["current"]]
+    values = [_xpath_eval(argument, ctx, env) for argument in args]
+    if name == "not":
+        return not _xpath_bool(values[0])
+    if name == "true":
+        return True
+    if name == "false":
+        return False
+    if name == "boolean":
+        return _xpath_bool(values[0])
+    if name == "string":
+        return _xpath_string(values[0]) if values else _xnode_string(ctx)
+    if name == "number":
+        return _xpath_number(values[0] if values else _xnode_string(ctx))
+    if name == "count":
+        if not isinstance(values[0], list):
+            raise _XPathUnsupported("count() of a non-node-set")
+        return float(len(values[0]))
+    if name == "concat":
+        return "".join(_xpath_string(v) for v in values)
+    if name == "contains":
+        return _xpath_string(values[1]) in _xpath_string(values[0])
+    if name == "starts-with":
+        return _xpath_string(values[0]).startswith(_xpath_string(values[1]))
+    if name == "string-length":
+        return float(len(_xpath_string(values[0]) if values else _xnode_string(ctx)))
+    if name in ("derived-from", "derived-from-or-self"):
+        nodes = values[0]
+        if not isinstance(nodes, list):
+            raise _XPathUnsupported("%s() of a non-node-set" % name)
+        if not nodes:
+            return False
+        identity = _xpath_string(values[1]).split(":")[-1]
+        if name == "derived-from-or-self" and any(
+            _xnode_string(node).split(":")[-1] == identity for node in nodes
+        ):
+            return True
+        # actual derivation would need the identity hierarchy, which the
+        # bindings do not carry -- err on the side of not failing
+        raise _XPathUnsupported("%s() beyond an exact identity match" % name)
+    raise _XPathUnsupported("function %s()" % name)
+
+
+def _xpath_eval(ast, ctx, env):
+    op = ast[0]
+    if op in ("num", "lit"):
+        return ast[1]
+    if op == "or":
+        return _xpath_bool(_xpath_eval(ast[1], ctx, env)) or _xpath_bool(
+            _xpath_eval(ast[2], ctx, env)
+        )
+    if op == "and":
+        return _xpath_bool(_xpath_eval(ast[1], ctx, env)) and _xpath_bool(
+            _xpath_eval(ast[2], ctx, env)
+        )
+    if op == "cmp":
+        return _xpath_compare(
+            ast[1], _xpath_eval(ast[2], ctx, env), _xpath_eval(ast[3], ctx, env)
+        )
+    if op == "arith":
+        left = _xpath_number(_xpath_eval(ast[2], ctx, env))
+        right = _xpath_number(_xpath_eval(ast[3], ctx, env))
+        symbol = ast[1]
+        try:
+            if symbol == "+":
+                return left + right
+            if symbol == "-":
+                return left - right
+            if symbol == "*":
+                return left * right
+            if symbol == "div":
+                return left / right
+            return left - right * float(int(left / right))  # mod, sign of left
+        except (ZeroDivisionError, OverflowError, ValueError):
+            return float("nan")
+    if op == "neg":
+        return -_xpath_number(_xpath_eval(ast[1], ctx, env))
+    if op == "union":
+        left = _xpath_eval(ast[1], ctx, env)
+        right = _xpath_eval(ast[2], ctx, env)
+        if not isinstance(left, list) or not isinstance(right, list):
+            raise _XPathUnsupported("'|' of non-node-sets")
+        return left + [node for node in right if node not in left]
+    if op == "call":
+        return _xpath_call(ast[1], ast[2], ctx, env)
+    # op == "path"
+    start = ast[1]
+    if start[0] == "root":
+        nodes = [env["doc"]]
+    elif start[0] == "ctx":
+        nodes = [ctx]
+    else:  # ("filter", primary, predicates)
+        value = _xpath_eval(start[1], ctx, env)
+        if not isinstance(value, list):
+            raise _XPathUnsupported("path step on a non-node-set")
+        nodes = value
+        for predicate in start[2]:
+            nodes = _xpath_filter(nodes, predicate, env)
+    for axis, test, predicates in ast[2]:
+        nodes = _xpath_axis(nodes, axis, test)
+        for predicate in predicates:
+            nodes = _xpath_filter(nodes, predicate, env)
+    return nodes
+
+
+_xpath_ast_cache = {}
+
+
+def _xpath_check(expression, ctx, doc):
+    """Boolean outcome of a must/when expression with context node `ctx`
+    (which is also what current() returns)."""
+    ast = _xpath_ast_cache.get(expression)
+    if ast is None:
+        ast = _XPathParser(_xpath_tokenize(expression)).parse()
+        _xpath_ast_cache[expression] = ast
+    return _xpath_bool(_xpath_eval(ast, ctx, {"current": ctx, "doc": doc}))
 '''
 
 # Runtime embedded at the top of the generated module unless
@@ -395,16 +984,28 @@ def validate_tree(*roots):
     leaf and leaf-list element (covering in-place list mutation such as
     ``.append()``), mandatory leaves, list keys (present and unique),
     ``unique`` groups, leaf-list value uniqueness, min-/max-elements,
-    choice exclusivity and mandatory choices, and leafref referential
-    integrity across all the given roots. Existence follows YANG: a
-    non-presence container exists only if some descendant is set, and
-    conditional rules (mandatory, min-elements, mandatory choices) apply
-    only where the surrounding context exists. ``must``/``when``
-    expressions are not evaluated. Collects every violation and raises a
+    choice exclusivity and mandatory choices, leafref referential
+    integrity across all the given roots, and YANG ``must``/``when``
+    expressions (evaluated with an embedded XPath 1.0 subset engine
+    wherever the constrained node exists; absolute paths resolve across
+    all the given roots, so pass every module root the expressions
+    reach into). Existence follows YANG: a non-presence container
+    exists only if some descendant is set, and conditional rules
+    (mandatory, min-elements, mandatory choices) apply only where the
+    surrounding context exists. Collects every violation and raises a
     single YangValidationError listing them all."""
     errors = []
     leaf_values = {}  # target schema path -> values present in the trees
     leafref_uses = []  # (instance path, target schema path, value)
+    constraints = []  # (is_must, context _XNode, expression, message, path)
+    doc = _XNode(None, None, None, roots=list(roots))
+
+    def queue_constraints(meta, xnode, fpath):
+        for expression, message in meta.musts:
+            constraints.append((True, xnode, expression, message, fpath))
+        for expression, self_context in meta.whens:
+            context = xnode if self_context else xnode.parent
+            constraints.append((False, context, expression, None, fpath))
 
     def note_value(schema_path, value):
         try:
@@ -420,7 +1021,7 @@ def validate_tree(*roots):
         except YangValidationError as exc:
             errors.append(str(exc))
 
-    def walk(node, path, schema_path, parent_module):
+    def walk(node, path, schema_path, parent_module, xself):
         fields = getattr(type(node), "_yang_fields", {})
         active_cases = {}  # choice -> set of cases with data
         # (case-or-None, message): applies only if this node exists (and,
@@ -435,7 +1036,10 @@ def validate_tree(*roots):
             field_set = False
             if meta.kind == "container":
                 if value is not None:
-                    field_set = walk(value, fpath, fschema, meta.module)
+                    xchild = _XNode(value, meta, xself)
+                    field_set = walk(value, fpath, fschema, meta.module, xchild)
+                    if field_set or meta.presence:
+                        queue_constraints(meta, xchild, fpath)
             elif meta.kind == "list":
                 entries = value or []
                 seen_keys = set()
@@ -443,7 +1047,9 @@ def validate_tree(*roots):
                 for index, entry in enumerate(entries):
                     key_text = _instance_key(entry, meta)
                     epath = "%s[%s]" % (fpath, index if key_text is None else key_text)
-                    walk(entry, epath, fschema, meta.module)
+                    xentry = _XNode(entry, meta, xself)
+                    walk(entry, epath, fschema, meta.module, xentry)
+                    queue_constraints(meta, xentry, epath)
                     field_set = True
                     for key in meta.keys:
                         if getattr(entry, key, None) is None:
@@ -488,6 +1094,12 @@ def validate_tree(*roots):
                     note_value(fschema, element)
                     if meta.leafref is not None:
                         leafref_uses.append((epath, meta.leafref, element))
+                    if meta.musts or meta.whens:
+                        queue_constraints(
+                            meta,
+                            _XNode(None, meta, xself, value=element, is_leaf=True),
+                            epath,
+                        )
                     try:
                         if element in seen_elements:
                             errors.append(
@@ -514,7 +1126,7 @@ def validate_tree(*roots):
                 if meta.cls is not None and isinstance(value, meta.cls):
                     # a bits dataclass: re-check its bit fields; it counts
                     # as set only when some bit is set (truthy)
-                    walk(value, fpath, fschema, meta.module)
+                    walk(value, fpath, fschema, meta.module, _XNode(value, meta, xself))
                     field_set = bool(value)
                 elif value is not None:
                     check_value(meta.check, value, fpath)
@@ -523,6 +1135,12 @@ def validate_tree(*roots):
                         if meta.leafref is not None:
                             leafref_uses.append((fpath, meta.leafref, value))
                     field_set = True
+                if field_set and (meta.musts or meta.whens):
+                    queue_constraints(
+                        meta,
+                        _XNode(None, meta, xself, value=value, is_leaf=True),
+                        fpath,
+                    )
                 if meta.kind == "leaf" and meta.mandatory and value is None:
                     pending.append((meta.case, "%s: mandatory leaf is not set" % fpath))
             if field_set:
@@ -547,11 +1165,29 @@ def validate_tree(*roots):
         return exists
 
     for root in roots:
-        walk(root, "", "", None)
+        walk(root, "", "", None, doc)
     for path, target, value in leafref_uses:
         if value not in leaf_values.get(target, ()):
             errors.append(
                 "%s: leafref %r has no matching instance at %s" % (path, value, target)
+            )
+    for is_must, context, expression, message, fpath in constraints:
+        if context is None:
+            continue
+        try:
+            satisfied = _xpath_check(expression, context, doc)
+        except _XPathUnsupported:
+            continue  # outside the evaluated subset: skip, never misjudge
+        if satisfied:
+            continue
+        if is_must:
+            errors.append(
+                "%s: %s" % (fpath, message or "violates must %r" % expression)
+            )
+        else:
+            errors.append(
+                "%s: node is present but its when condition %r is false"
+                % (fpath, expression)
             )
     if errors:
         raise YangValidationError(
@@ -797,6 +1433,15 @@ class PybindDataclassPlugin(plugin.PyangPlugin):
             "exposes the same names as a single-file build",
         )
         group.add_option(
+            "--no-dataclass-must-when",
+            dest="no_dataclass_must_when",
+            action="store_true",
+            default=False,
+            help="Do not emit YANG must/when XPath constraints into the "
+            "field metadata; validate_tree() then skips them "
+            "(must/when evaluation is generated by default)",
+        )
+        group.add_option(
             "--no-dataclass-defaults",
             dest="no_dataclass_defaults",
             action="store_true",
@@ -815,6 +1460,7 @@ class PybindDataclassPlugin(plugin.PyangPlugin):
             fd,
             with_validation=not getattr(ctx.opts, "no_dataclass_validation", False),
             with_defaults=not getattr(ctx.opts, "no_dataclass_defaults", False),
+            with_must_when=not getattr(ctx.opts, "no_dataclass_must_when", False),
             with_origin_comments=getattr(ctx.opts, "dataclass_origin_comments", False),
             with_serde=getattr(ctx.opts, "dataclass_serde", False),
             with_xpaths=getattr(ctx.opts, "dataclass_xpaths", False),
@@ -912,13 +1558,15 @@ class _Emitter:
     def __init__(
         self, ctx, identity_values, with_validation, with_defaults,
         with_origin_comments=False, with_serde=False, with_xpaths=False,
-        identity_canonical=None,
+        identity_canonical=None, with_must_when=True,
     ):
         self.ctx = ctx
         self.identity_values = identity_values
         self.identity_canonical = identity_canonical or {}
         self.with_validation = with_validation
         self.with_defaults = with_defaults
+        # must/when metadata only matters to validate_tree
+        self.with_must_when = with_must_when and with_validation
         self.with_origin_comments = with_origin_comments
         self.with_serde = with_serde
         self.with_xpaths = with_xpaths
@@ -1127,6 +1775,83 @@ class _Emitter:
             return None
         return path
 
+    # ---- must / when constraints ----------------------------------------
+
+    def _xpath_source(self, stmt):
+        """Prefix-normalized text of a must/when XPath expression --
+        prefixes rewritten to module names, matching the name-matching
+        convention of the generated evaluator -- or None when the
+        expression falls outside the evaluated subset (explicit axes,
+        attributes, variables, unimplemented functions, prefixes that
+        don't resolve or that point at modules outside the emitted set).
+        Skipped constraints are simply not enforced, never misjudged."""
+        module = getattr(stmt, "i_orig_module", None) or stmt.top
+        prefixes = getattr(module, "i_prefixes", None) or {}
+        parts = re.split(r"""("[^"]*"|'[^']*')""", stmt.arg)
+        out = []
+        for index, part in enumerate(parts):
+            if index % 2:  # a string literal: keep verbatim
+                out.append(part)
+                continue
+            if "::" in part or "@" in part or "$" in part:
+                return None
+            for call in re.finditer(r"([A-Za-z_][\w.-]*)\s*\(", part):
+                if call.group(1) not in _XPATH_SUPPORTED_FUNCTIONS:
+                    return None
+            unresolved = []
+
+            def rewrite(match):
+                mapped = prefixes.get(match.group(1))
+                if mapped is None or mapped[0] not in self.emitted_module_names:
+                    unresolved.append(match.group(1))
+                    return match.group(0)
+                return "%s:" % mapped[0]
+
+            part = re.sub(r"([A-Za-z_][\w.-]*):(?=[A-Za-z_*])", rewrite, part)
+            if unresolved:
+                return None
+            out.append(re.sub(r"\s+", " ", part))
+        return "".join(out)
+
+    def _constraint_exprs(self, child, when_stmts=()):
+        """(musts, whens) metadata tuples for one data node. musts are
+        (expression, error-message-or-None) pairs; whens are
+        (expression, context-is-self) pairs -- a `when` written on the
+        node itself has the node as XPath context, one inherited from a
+        uses / augment / choice / case has the parent (RFC 7950
+        7.21.5). Constraints outside the evaluated subset are dropped
+        (see _xpath_source)."""
+        musts = []
+        for must in child.search("must"):
+            expression = self._xpath_source(must)
+            if expression is None:
+                continue
+            error_message = must.search_one("error-message")
+            musts.append(
+                (expression, error_message.arg if error_message is not None else None)
+            )
+        whens = []
+
+        def add_when(stmt, self_context):
+            if stmt is None:
+                return
+            expression = self._xpath_source(stmt)
+            if expression is not None and (expression, self_context) not in whens:
+                whens.append((expression, self_context))
+
+        for when in child.search("when"):
+            # pyang copies a uses' when onto every expanded child (marked
+            # i_origin='uses'); those keep the parent as context node
+            add_when(when, getattr(when, "i_origin", None) != "uses")
+        for uses in getattr(child, "i_uses", None) or []:
+            add_when(uses.search_one("when"), False)
+        augment = getattr(child, "i_augment", None)
+        if augment is not None:
+            add_when(augment.search_one("when"), False)
+        for stmt in when_stmts:  # choice/case levels flattened away
+            add_when(stmt, False)
+        return tuple(musts), tuple(whens)
+
     def _encode_tag(self, type_stmt, node, depth=0):
         """IETF-JSON value encoding tag for types that do not encode as
         their natural Python/JSON value, or None."""
@@ -1187,7 +1912,7 @@ class _Emitter:
             build,
         )
 
-    def field_meta_expr(self, child, case, cls_name=None):
+    def field_meta_expr(self, child, case, cls_name=None, when_stmts=()):
         """`_FieldMeta(...)` constructor source for one field."""
         kind = child.keyword
         args = [repr(child.arg), repr(self._module_name(child)), repr(kind)]
@@ -1234,6 +1959,12 @@ class _Emitter:
                 args.append("unique=%r" % (tuple(unique_groups),))
         if case is not None:
             args.append("case=%r" % (case,))
+        if self.with_must_when:
+            musts, whens = self._constraint_exprs(child, when_stmts)
+            if musts:
+                args.append("musts=%r" % (musts,))
+            if whens:
+                args.append("whens=%r" % (whens,))
         return "_FieldMeta(%s)" % ", ".join(args)
 
     @staticmethod
@@ -1400,9 +2131,11 @@ class _Emitter:
     @staticmethod
     def _flattened_children(stmt):
         """Config-true data children with choice/case flattened away.
-        Returns (entries, choices): entries as (child, case) pairs where
-        `case` is the (outermost) (choice, case) pair a child was
-        flattened out of, or None; choices as choice name -> mandatory."""
+        Returns (entries, choices): entries as (child, case, when_stmts)
+        triples where `case` is the (outermost) (choice, case) pair a
+        child was flattened out of (or None) and `when_stmts` the `when`
+        statements of the flattened-away choice/case levels; choices as
+        choice name -> mandatory."""
         entries, choices = [], {}
         for child in getattr(stmt, "i_children", []) or []:
             if child.keyword not in _DATA_KEYWORDS:
@@ -1412,23 +2145,30 @@ class _Emitter:
             if child.keyword == "choice":
                 mandatory = child.search_one("mandatory")
                 choices[child.arg] = mandatory is not None and mandatory.arg == "true"
+                choice_whens = tuple(
+                    w for w in (child.search_one("when"),) if w is not None
+                )
                 for case in getattr(child, "i_children", []) or []:
                     if case.keyword == "case":
+                        case_whens = choice_whens + tuple(
+                            w for w in (case.search_one("when"),) if w is not None
+                        )
                         sub_entries, sub_choices = _Emitter._flattened_children(case)
                         entries.extend(
-                            (sub, (child.arg, case.arg)) for sub, _ in sub_entries
+                            (sub, (child.arg, case.arg), case_whens + sub_whens)
+                            for sub, _, sub_whens in sub_entries
                         )
                         choices.update(sub_choices)
                     elif case.keyword in _DATA_KEYWORDS:  # shorthand case
-                        entries.append((case, (child.arg, case.arg)))
+                        entries.append((case, (child.arg, case.arg), choice_whens))
             else:
-                entries.append((child, None))
+                entries.append((child, None, ()))
         return entries, choices
 
     @staticmethod
     def _data_children(stmt):
         """Config-true data children, with choice/case flattened away."""
-        return [child for child, _ in _Emitter._flattened_children(stmt)[0]]
+        return [child for child, _, _ in _Emitter._flattened_children(stmt)[0]]
 
     def _docstring(self, stmt, indent):
         desc_stmt = stmt.search_one("description")
@@ -1540,7 +2280,7 @@ class _Emitter:
         used_class_names = set()
         field_metas = []
         entries, choices = self._flattened_children(stmt)
-        for child, case in entries:
+        for child, case, when_stmts in entries:
             fname = safe_name(child.arg)
             if self.with_origin_comments:
                 comment = self._origin_comment(child)
@@ -1563,7 +2303,9 @@ class _Emitter:
                         % (body_indent, fname, child_cname)
                     )
                 self.lines.append("")
-                field_metas.append((fname, self.field_meta_expr(child, case, child_cname)))
+                field_metas.append(
+                    (fname, self.field_meta_expr(child, case, child_cname, when_stmts))
+                )
             else:  # leaf / leaf-list
                 resolved = self._resolve_typedef_chain(child.search_one("type"))
                 if resolved.arg == "bits" and resolved.search("bit"):
@@ -1583,11 +2325,13 @@ class _Emitter:
                         )
                     self.lines.append("")
                     field_metas.append(
-                        (fname, self.field_meta_expr(child, case, bits_cname))
+                        (fname, self.field_meta_expr(child, case, bits_cname, when_stmts))
                     )
                     continue
                 self._emit_leaf(child, fname, body_indent)
-                field_metas.append((fname, self.field_meta_expr(child, case)))
+                field_metas.append(
+                    (fname, self.field_meta_expr(child, case, when_stmts=when_stmts))
+                )
 
         if self.with_meta:
             self.lines.append("")
@@ -1615,7 +2359,7 @@ class _Emitter:
 def build_dataclasses(
     ctx, modules, fd, with_validation=True, with_defaults=True,
     with_origin_comments=False, with_serde=False, with_xpaths=False,
-    split_dir=None,
+    split_dir=None, with_must_when=True,
 ):
     identity_values, identity_canonical = _build_identity_values(ctx)
 
@@ -1623,6 +2367,7 @@ def build_dataclasses(
         ctx, identity_values, with_validation, with_defaults,
         with_origin_comments=with_origin_comments, with_serde=with_serde,
         with_xpaths=with_xpaths, identity_canonical=identity_canonical,
+        with_must_when=with_must_when,
     )
     # Reserve the top-level module class names so a reusable type (emitted in
     # the same module namespace) can never shadow one of them.
@@ -1671,6 +2416,7 @@ def build_dataclasses(
     if emitter.with_meta:
         header.append(_META_RUNTIME.rstrip())
     if with_validation:
+        header.append(_XPATH_EVAL_RUNTIME.rstrip())
         header.append(_VALIDATION_RUNTIME.rstrip())
     if with_serde:
         header.append(_SERDE_RUNTIME.rstrip())
@@ -1719,6 +2465,7 @@ def _write_split_package(
     if emitter.with_meta:
         runtime_blocks.append(_META_RUNTIME.rstrip())
     if with_validation:
+        runtime_blocks.append(_XPATH_EVAL_RUNTIME.rstrip())
         runtime_blocks.append(_VALIDATION_RUNTIME.rstrip())
     if with_serde:
         runtime_blocks.append(_SERDE_RUNTIME.rstrip())
