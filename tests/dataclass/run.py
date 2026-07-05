@@ -643,6 +643,58 @@ class DataclassNoValidationTests(unittest.TestCase):
         self.assertEqual(self.bindings.Dataclass.Box().with_default, "lol")
 
 
+class DataclassXsdPatternTests(unittest.TestCase):
+    """XSD-flavored regexes (dataclass-xsd-pattern.yang): \\p{...}
+    Unicode category escapes are translated to ASCII approximations
+    instead of silently dropping the pattern -- dropping the BASE
+    pattern of an RFC 6991-style typedef chain (ipv4-address-no-zone)
+    used to leave only the weak derived restriction in force."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bindings = generate(
+            yang_file=os.path.join(TEST_PATH, "dataclass-xsd-pattern.yang")
+        )
+
+    def test_patterns_accumulate_across_typedef_chain(self):
+        patterns = self.bindings.DataclassXsdPattern.Box._yang_fields[
+            "addr"
+        ].check.patterns
+        self.assertEqual(len(patterns), 2)  # derived AND (translated) base
+
+    def test_base_pattern_enforced_through_derived_typedef(self):
+        box = self.bindings.DataclassXsdPattern.Box()
+        box.addr = "192.0.2.1"
+        with self.assertRaises(self.bindings.YangValidationError):
+            box.addr = "999.1.1.1"  # passes '[0-9\\.]*', fails the base pattern
+
+    def test_translated_category_escape_matches(self):
+        box = self.bindings.DataclassXsdPattern.Box()
+        box.zoned_addr = "192.0.2.1%eth0"  # \\p{N}\\p{L} -> [0-9A-Za-z]
+        with self.assertRaises(self.bindings.YangValidationError):
+            box.zoned_addr = "192.0.2.1%"  # zone must be non-empty
+
+    def test_negated_category_pattern_dropped_not_misjudged(self):
+        # \\P{...} is untranslatable: the pattern is unenforced, so any
+        # string is accepted (and generation did not crash).
+        box = self.bindings.DataclassXsdPattern.Box()
+        box.negated = "letters would violate the original pattern"
+
+    def test_python_pattern_translation_unit(self):
+        sys.path.insert(0, BASE_DIR)
+        try:
+            from pyangbind.plugin.pybind_dataclass import _python_pattern
+        finally:
+            sys.path.pop(0)
+        self.assertEqual(_python_pattern("[a-z]+"), "[a-z]+")  # untouched
+        self.assertEqual(
+            _python_pattern(r"(%[\p{N}\p{L}]+)?"), "(%[0-9A-Za-z]+)?"
+        )
+        self.assertEqual(_python_pattern(r"\p{Lu}\p{Nd}*"), "[A-Z][0-9]*")
+        self.assertIsNone(_python_pattern(r"[\P{L}]+"))  # no safe negation
+        self.assertIsNone(_python_pattern(r"\p{Zs}"))  # unmapped category
+
+
 class DataclassMustWhenTests(unittest.TestCase):
     """validate_tree() evaluates YANG must/when constraints with the
     embedded XPath 1.0 subset engine (dataclass-constraints.yang)."""

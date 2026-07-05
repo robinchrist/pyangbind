@@ -1,0 +1,43 @@
+module dataclass-xsd-pattern {
+  yang-version 1.1;
+  namespace "http://pyangbind.example.com/dataclass-xsd-pattern";
+  prefix "dxp";
+
+  description
+    "Fixture for XSD-flavored regex handling: RFC 6991-style typedef
+     derivation where the BASE pattern carries a backslash-p Unicode
+     category escape (unsupported by Python's re) and the derived
+     typedef adds a restriction pattern. All patterns along the chain
+     must be enforced together -- historically the uncompilable base
+     pattern was silently dropped, leaving only the weak derived one.";
+
+  typedef host-address {
+    type string {
+      pattern '(([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\.){3}'
+            + '([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])'
+            + '(%[\p{N}\p{L}]+)?';
+    }
+  }
+
+  typedef host-address-no-zone {
+    type host-address {
+      pattern '[0-9\.]*';
+    }
+  }
+
+  container box {
+    leaf addr {
+      type host-address-no-zone;
+    }
+    leaf zoned-addr {
+      type host-address;
+    }
+    leaf negated {
+      // \P{...} has no safe ASCII approximation: this pattern must be
+      // dropped (unenforced), never misjudged or crash generation.
+      type string {
+        pattern '[\P{L}]+';
+      }
+    }
+  }
+}

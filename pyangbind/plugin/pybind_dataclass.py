@@ -1540,6 +1540,73 @@ def _parse_bound(text):
         return float(text)
 
 
+# XSD Unicode category escapes (\p{...}) that Python's re module does not
+# support, mapped to conservative ASCII approximations. Under-accepting
+# non-ASCII letters/digits is the safe direction for config-text values.
+_XSD_CATEGORY_ASCII = {
+    "L": "A-Za-z",
+    "Lu": "A-Z",
+    "Ll": "a-z",
+    "N": "0-9",
+    "Nd": "0-9",
+}
+
+_XSD_CATEGORY_RE = re.compile(r"\\p\{([A-Za-z]{1,2})\}")
+
+
+def _python_pattern(arg):
+    """Translate a YANG (XSD-flavored) regex into one Python's re can
+    compile, or None if it can't be salvaged (that pattern is then not
+    enforced rather than misjudged).
+
+    XSD and Python regexes mostly coincide; the one construct common in
+    real-world models (RFC 6991's zone-id suffixes) is the Unicode
+    category escape \\p{...}, which re lacks. Those are rewritten to
+    ASCII approximations, tracking whether the escape sits inside a
+    character class (bare class content) or outside (wrapped in []).
+    Patterns using anything else re can't compile -- including negated
+    \\P{...} categories, which have no safe ASCII approximation -- are
+    dropped."""
+    try:
+        re.compile(arg)
+        return arg
+    except re.error:
+        pass
+    out = []
+    pos = 0
+    in_class = False
+    length = len(arg)
+    while pos < length:
+        char = arg[pos]
+        if char == "\\" and pos + 1 < length:
+            nxt = arg[pos + 1]
+            if nxt == "p":
+                match = _XSD_CATEGORY_RE.match(arg, pos)
+                ascii_class = match and _XSD_CATEGORY_ASCII.get(match.group(1))
+                if not ascii_class:
+                    return None
+                out.append(ascii_class if in_class else "[%s]" % ascii_class)
+                pos = match.end()
+                continue
+            if nxt == "P":
+                return None
+            out.append(arg[pos : pos + 2])
+            pos += 2
+            continue
+        if char == "[":
+            in_class = True
+        elif char == "]":
+            in_class = False
+        out.append(char)
+        pos += 1
+    translated = "".join(out)
+    try:
+        re.compile(translated)
+    except re.error:
+        return None
+    return translated
+
+
 def _parse_range_arg(arg):
     """'1..20 | 100 | 200..max' -> ((1, 20), (100, 100), (200, None))."""
     parts = []
@@ -2000,11 +2067,9 @@ class _Emitter:
             if length_stmt is not None:
                 lengths.append(_parse_range_arg(length_stmt.arg))
             for pattern_stmt in level.search("pattern"):
-                try:  # YANG uses XSD regexes; skip the rare Python-incompatible one
-                    re.compile(pattern_stmt.arg)
-                except re.error:
-                    continue
-                patterns.append(pattern_stmt.arg)
+                pattern = _python_pattern(pattern_stmt.arg)
+                if pattern is not None:
+                    patterns.append(pattern)
 
         values = ()
         bits = ()
