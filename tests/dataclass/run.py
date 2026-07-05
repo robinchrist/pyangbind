@@ -275,6 +275,133 @@ class DataclassMetadataTests(unittest.TestCase):
         self.assertEqual(self.top.Refs.Server(), self.top.Refs.Server())
 
 
+class DataclassValidateTreeTests(unittest.TestCase):
+    """validate_tree(): the whole-tree pass covering what on-assignment
+    validation cannot (leafref integrity, mandatory, keys, unique,
+    min/max-elements, choice rules, in-place list mutation)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bindings = generate()
+
+    def setUp(self):
+        self.tree = self.bindings.Dataclass()
+
+    def _valid_refs(self):
+        Server = self.bindings.Dataclass.Refs.Server
+        refs = self.tree.refs
+        refs.server = [
+            Server(name="a", port=80, proto="tcp"),
+            Server(name="b", port=443, proto="tcp"),
+        ]
+        refs.active_server = "a"
+        refs.tags = ["prod"]
+        refs.tcp_port = 8080
+        return refs
+
+    def _violations(self):
+        try:
+            self.bindings.validate_tree(self.tree)
+        except self.bindings.YangValidationError as exc:
+            return str(exc)
+        return ""
+
+    def test_valid_tree_passes(self):
+        self._valid_refs()
+        self.bindings.validate_tree(self.tree)
+
+    def test_empty_tree_passes(self):
+        # refs never comes into existence, so its mandatory choice,
+        # mandatory leaves and min-elements do not apply.
+        self.bindings.validate_tree(self.tree)
+
+    def test_leafref_violation(self):
+        refs = self._valid_refs()
+        refs.active_server = "nope"
+        self.assertIn("no matching instance", self._violations())
+
+    def test_require_instance_false_not_checked(self):
+        refs = self._valid_refs()
+        refs.unchecked_server = "nope"  # same target, but require-instance false
+        self.bindings.validate_tree(self.tree)
+
+    def test_leafref_creation_order_does_not_matter(self):
+        refs = self._valid_refs()
+        # reference first, target afterwards -- only the final pass judges
+        refs.active_server = "c"
+        refs.server.append(
+            self.bindings.Dataclass.Refs.Server(name="c", port=8443, proto="tcp")
+        )
+        self.bindings.validate_tree(self.tree)
+
+    def test_append_hole_is_closed(self):
+        refs = self._valid_refs()
+        refs.tags.append(42)  # bypasses on-assignment validation
+        self.assertIn("str-compatible", self._violations())
+
+    def test_mandatory_leaf(self):
+        refs = self._valid_refs()
+        refs.server[0].proto = None
+        self.assertIn("mandatory leaf", self._violations())
+
+    def test_missing_and_duplicate_list_keys(self):
+        refs = self._valid_refs()
+        Server = self.bindings.Dataclass.Refs.Server
+        refs.server.append(Server(port=1, proto="udp"))  # no key
+        refs.server.append(Server(name="a", port=2, proto="udp"))  # dup key
+        violations = self._violations()
+        self.assertIn("list key 'name' is not set", violations)
+        self.assertIn("duplicate list key", violations)
+
+    def test_unique_violation(self):
+        refs = self._valid_refs()
+        refs.server[1].port = 80  # same port as server 'a'
+        self.assertIn("unique", self._violations())
+
+    def test_max_elements(self):
+        refs = self._valid_refs()
+        Server = self.bindings.Dataclass.Refs.Server
+        for i in range(3):
+            refs.server.append(Server(name="x%d" % i, port=1000 + i, proto="t"))
+        self.assertIn("max-elements", self._violations())
+
+    def test_min_elements(self):
+        refs = self._valid_refs()
+        refs.tags = []
+        self.assertIn("min-elements", self._violations())
+
+    def test_choice_exclusivity(self):
+        refs = self._valid_refs()
+        refs.udp_port = 9999  # tcp-port already set
+        self.assertIn("multiple cases of choice 'transport'", self._violations())
+
+    def test_mandatory_choice(self):
+        refs = self._valid_refs()
+        refs.tcp_port = None
+        self.assertIn("mandatory choice 'transport'", self._violations())
+
+    def test_violations_are_aggregated(self):
+        refs = self._valid_refs()
+        refs.active_server = "nope"
+        refs.tags = []
+        refs.server[0].proto = None
+        message = self._violations()
+        self.assertIn("3 violation(s)", message)
+
+    def test_instance_paths_use_list_keys(self):
+        refs = self._valid_refs()
+        refs.server[1].proto = None
+        self.assertIn("server[name='b']", self._violations())
+
+    def test_fraction_digits_on_assignment(self):
+        import decimal
+
+        refs = self._valid_refs()
+        refs.ratio = decimal.Decimal("1.25")
+        with self.assertRaises(self.bindings.YangValidationError):
+            refs.ratio = decimal.Decimal("1.256")
+
+
 class DataclassNoDefaultsTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

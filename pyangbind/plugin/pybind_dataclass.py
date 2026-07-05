@@ -44,14 +44,25 @@ Validation (disable with ``--no-dataclass-validation``)
     A small (stdlib-only) runtime is embedded in the generated module and
     every generated class validates values *on assignment* (including
     dataclass ``__init__`` keyword arguments): base-type checks, integer /
-    decimal ranges, string lengths and patterns, enumeration and
-    identityref value sets, bits names, union membership. Violations raise
-    ``YangValidationError``. Leaf-list elements are validated when the
-    list is assigned; in-place ``.append()`` is not intercepted.
-    Structural rules (mandatory, list keys/uniqueness, when/must) are NOT
-    checked. The ``__setattr__`` hook is defined under ``if not
+    decimal ranges (incl. decimal64 fraction-digits), string lengths and
+    patterns, enumeration and identityref value sets, bits names, union
+    membership. Violations raise ``YangValidationError``. Leaf-list
+    elements are validated when the list is assigned; in-place
+    ``.append()`` is not intercepted (but is caught by ``validate_tree``).
+    The ``__setattr__`` hook is defined under ``if not
     typing.TYPE_CHECKING`` so static checkers keep enforcing the declared
     field types instead of degrading to any-attribute-assignable.
+
+    Structural and referential rules cannot be checked on assignment (a
+    leafref target may legitimately not exist *yet*; mandatory/keys can
+    only be judged on a finished tree), so the module also gets a
+    ``validate_tree(*roots)`` function for one final whole-tree pass:
+    re-validates every value, then checks leafref referential integrity
+    (across all passed roots), mandatory leaves, list keys present and
+    unique, ``unique`` groups, leaf-list value uniqueness, min-/max-
+    elements, and choice exclusivity / mandatory choices. All violations
+    are collected and raised as one ``YangValidationError``. ``must`` /
+    ``when`` are NOT evaluated (that would need an XPath engine).
 
 Defaults (disable with ``--no-dataclass-defaults``)
     YANG ``default`` statements (from the leaf itself or its typedef
@@ -193,6 +204,7 @@ class _Check:
     values: tuple = ()  # allowed enum/identityref strings; () = unrestricted
     bits: tuple = ()  # allowed bit names; () = unrestricted
     members: tuple = ()  # union member checks; at least one must pass
+    fraction_digits: int = 0  # decimal64 precision; 0 = not a decimal64
 
     def validate(self, value, path):
         if self.base == "union":
@@ -206,6 +218,8 @@ class _Check:
                 "%s: %r does not match any member type of the union" % (path, value)
             )
         self._check_base_type(value, path)
+        if self.fraction_digits:
+            self._check_decimal64(value, path)
         if self.values and value not in self.values:
             raise YangValidationError(
                 "%s: %r is not one of the allowed values %s" % (path, value, list(self.values))
@@ -265,6 +279,22 @@ class _Check:
                 "%s: expected a %s-compatible value, got %r" % (path, base, value)
             )
 
+    def _check_decimal64(self, value, path):
+        dec = value if isinstance(value, decimal.Decimal) else decimal.Decimal(str(value))
+        exponent = dec.normalize().as_tuple().exponent
+        if isinstance(exponent, int) and -exponent > self.fraction_digits:
+            raise YangValidationError(
+                "%s: %s has more than fraction-digits %d decimal places"
+                % (path, dec, self.fraction_digits)
+            )
+        # implied decimal64 range: -2**63 .. 2**63-1, scaled by fraction-digits
+        low = decimal.Decimal(-(2**63)).scaleb(-self.fraction_digits)
+        high = decimal.Decimal(2**63 - 1).scaleb(-self.fraction_digits)
+        if not low <= dec <= high:
+            raise YangValidationError(
+                "%s: %s is outside the decimal64 range %s..%s" % (path, dec, low, high)
+            )
+
 
 class _YangNode:
     """Base of every generated dataclass: validates each assignment
@@ -284,6 +314,194 @@ class _YangNode:
                 else:
                     meta.check.validate(value, path)
             object.__setattr__(self, name, value)
+
+
+def _instance_key(entry, meta):
+    """`key=value` text of a list entry's key leaves, for instance paths."""
+    if not meta.keys:
+        return None
+    entry_fields = getattr(type(entry), "_yang_fields", {})
+    parts = []
+    for key in meta.keys:
+        key_meta = entry_fields.get(key)
+        yang_key = key_meta.yang_name if key_meta is not None else key
+        parts.append("%s=%r" % (yang_key, getattr(entry, key, None)))
+    return ",".join(parts)
+
+
+def validate_tree(*roots):
+    """Whole-tree validation of one or more binding roots.
+
+    Checks everything on-assignment validation cannot: re-validates every
+    leaf and leaf-list element (covering in-place list mutation such as
+    ``.append()``), mandatory leaves, list keys (present and unique),
+    ``unique`` groups, leaf-list value uniqueness, min-/max-elements,
+    choice exclusivity and mandatory choices, and leafref referential
+    integrity across all the given roots. Existence follows YANG: a
+    non-presence container exists only if some descendant is set, and
+    conditional rules (mandatory, min-elements, mandatory choices) apply
+    only where the surrounding context exists. ``must``/``when``
+    expressions are not evaluated. Collects every violation and raises a
+    single YangValidationError listing them all."""
+    errors = []
+    leaf_values = {}  # target schema path -> values present in the trees
+    leafref_uses = []  # (instance path, target schema path, value)
+
+    def note_value(schema_path, value):
+        try:
+            leaf_values.setdefault(schema_path, set()).add(value)
+        except TypeError:
+            pass  # unhashable (e.g. a bits instance inside a union)
+
+    def check_value(check, value, path):
+        if check is None or value is None:
+            return
+        try:
+            check.validate(value, path)
+        except YangValidationError as exc:
+            errors.append(str(exc))
+
+    def walk(node, path, schema_path, parent_module):
+        fields = getattr(type(node), "_yang_fields", {})
+        active_cases = {}  # choice -> set of cases with data
+        # (case-or-None, message): applies only if this node exists (and,
+        # when tied to a case, only if that case is the active one).
+        pending = []
+        exists = False
+        for fname, meta in fields.items():
+            value = getattr(node, fname, None)
+            qualified = (
+                meta.yang_name
+                if meta.module == parent_module
+                else "%s:%s" % (meta.module, meta.yang_name)
+            )
+            fpath = "%s/%s" % (path, qualified)
+            fschema = "%s/%s" % (schema_path, qualified)
+            field_set = False
+            if meta.kind == "container":
+                if value is not None:
+                    field_set = walk(value, fpath, fschema, meta.module)
+            elif meta.kind == "list":
+                entries = value or []
+                seen_keys = set()
+                seen_unique = {group: set() for group in meta.unique}
+                for index, entry in enumerate(entries):
+                    key_text = _instance_key(entry, meta)
+                    epath = "%s[%s]" % (fpath, index if key_text is None else key_text)
+                    walk(entry, epath, fschema, meta.module)
+                    field_set = True
+                    for key in meta.keys:
+                        if getattr(entry, key, None) is None:
+                            errors.append("%s: list key '%s' is not set" % (epath, key))
+                    if meta.keys:
+                        key_tuple = tuple(getattr(entry, k, None) for k in meta.keys)
+                        if None not in key_tuple:
+                            if key_tuple in seen_keys:
+                                errors.append(
+                                    "%s: duplicate list key %r" % (epath, key_tuple)
+                                )
+                            seen_keys.add(key_tuple)
+                    for group in meta.unique:
+                        values = tuple(getattr(entry, g, None) for g in group)
+                        if None in values:
+                            continue  # unique applies only where all leaves exist
+                        if values in seen_unique[group]:
+                            errors.append(
+                                "%s: violates unique %r: %r is already present"
+                                % (epath, "/".join(group), values)
+                            )
+                        seen_unique[group].add(values)
+                if meta.max_elements is not None and len(entries) > meta.max_elements:
+                    errors.append(
+                        "%s: %d entries exceed max-elements %d"
+                        % (fpath, len(entries), meta.max_elements)
+                    )
+                if meta.min_elements and len(entries) < meta.min_elements:
+                    pending.append(
+                        (
+                            meta.case,
+                            "%s: %d entries, fewer than min-elements %d"
+                            % (fpath, len(entries), meta.min_elements),
+                        )
+                    )
+            elif meta.kind == "leaf-list":
+                elements = value or []
+                seen_elements = set()
+                for index, element in enumerate(elements):
+                    epath = "%s[%d]" % (fpath, index)
+                    check_value(meta.check, element, epath)
+                    note_value(fschema, element)
+                    if meta.leafref is not None:
+                        leafref_uses.append((epath, meta.leafref, element))
+                    try:
+                        if element in seen_elements:
+                            errors.append(
+                                "%s: duplicate leaf-list value %r" % (epath, element)
+                            )
+                        seen_elements.add(element)
+                    except TypeError:
+                        pass
+                if meta.max_elements is not None and len(elements) > meta.max_elements:
+                    errors.append(
+                        "%s: %d elements exceed max-elements %d"
+                        % (fpath, len(elements), meta.max_elements)
+                    )
+                if meta.min_elements and len(elements) < meta.min_elements:
+                    pending.append(
+                        (
+                            meta.case,
+                            "%s: %d elements, fewer than min-elements %d"
+                            % (fpath, len(elements), meta.min_elements),
+                        )
+                    )
+                field_set = bool(elements)
+            else:  # leaf (or one bool bit of a bits dataclass)
+                if meta.cls is not None and isinstance(value, meta.cls):
+                    # a bits dataclass: re-check its bit fields; it counts
+                    # as set only when some bit is set (truthy)
+                    walk(value, fpath, fschema, meta.module)
+                    field_set = bool(value)
+                elif value is not None:
+                    check_value(meta.check, value, fpath)
+                    if meta.kind == "leaf":
+                        note_value(fschema, value)
+                        if meta.leafref is not None:
+                            leafref_uses.append((fpath, meta.leafref, value))
+                    field_set = True
+                if meta.kind == "leaf" and meta.mandatory and value is None:
+                    pending.append((meta.case, "%s: mandatory leaf is not set" % fpath))
+            if field_set:
+                exists = True
+                if meta.case is not None:
+                    active_cases.setdefault(meta.case[0], set()).add(meta.case[1])
+        for choice, cases in active_cases.items():
+            if len(cases) > 1:
+                errors.append(
+                    "%s: fields of multiple cases of choice '%s' are set: %s"
+                    % (path or "/", choice, ", ".join(sorted(cases)))
+                )
+        for choice, mandatory in getattr(type(node), "_yang_choices", {}).items():
+            if mandatory and not active_cases.get(choice):
+                pending.append(
+                    (None, "%s: no case of mandatory choice '%s' is set" % (path or "/", choice))
+                )
+        if exists:
+            for case, message in pending:
+                if case is None or case[1] in active_cases.get(case[0], ()):
+                    errors.append(message)
+        return exists
+
+    for root in roots:
+        walk(root, "", "", None)
+    for path, target, value in leafref_uses:
+        if value not in leaf_values.get(target, ()):
+            errors.append(
+                "%s: leafref %r has no matching instance at %s" % (path, value, target)
+            )
+    if errors:
+        raise YangValidationError(
+            "%d violation(s):\\n  %s" % (len(errors), "\\n  ".join(errors))
+        )
 '''
 
 
@@ -761,6 +979,10 @@ class _Emitter:
             args.append("bits=%r" % (bits,))
         if members:
             args.append("members=(%s,)" % ", ".join(members))
+        if base.arg == "decimal64":
+            fraction_digits = base.search_one("fraction-digits")
+            if fraction_digits is not None:
+                args.append("fraction_digits=%d" % int(fraction_digits.arg))
         return "_Check(%s)" % ", ".join(args)
 
     # ---- YANG defaults ---------------------------------------------------

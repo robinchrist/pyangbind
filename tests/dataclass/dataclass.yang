@@ -135,6 +135,11 @@ module dataclass {
       type string;
       min-elements 1;
     }
+    leaf ratio {
+      type decimal64 {
+        fraction-digits 2;
+      }
+    }
     choice transport {
       mandatory true;
       case tcp {
