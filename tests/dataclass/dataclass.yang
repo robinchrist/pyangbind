@@ -149,6 +149,17 @@ module dataclass {
         fraction-digits 2;
       }
     }
+    // Serde-relevant encodings: 64-bit int (JSON string), binary
+    // (base64), empty ([null]).
+    leaf big {
+      type uint64;
+    }
+    leaf blob {
+      type binary;
+    }
+    leaf present {
+      type empty;
+    }
     choice transport {
       mandatory true;
       case tcp {

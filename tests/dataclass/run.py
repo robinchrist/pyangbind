@@ -440,6 +440,107 @@ class DataclassOriginCommentTests(unittest.TestCase):
         self.assertNotIn("# from ", plain._source)
 
 
+class DataclassSerdeTests(unittest.TestCase):
+    """--dataclass-serde: RFC 7951 JSON encoding over plain dicts."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bindings = generate("--dataclass-serde")
+
+    def setUp(self):
+        self.tree = self.bindings.Dataclass()
+
+    def test_encoding_shapes(self):
+        import decimal
+
+        refs = self.tree.refs
+        refs.server = [self.bindings.Dataclass.Refs.Server(name="a", port=80, proto="tcp")]
+        refs.active_server = "a"
+        refs.tags = ["x", "y"]
+        refs.tcp_port = 8080
+        refs.ratio = decimal.Decimal("1.25")
+        refs.big = 2**63
+        refs.blob = b"\x01\x02"
+        refs.present = True
+        self.tree.box.pet = "dc:dog"
+        encoded = self.bindings.to_ietf_json(self.tree)
+
+        self.assertIn("dataclass:refs", encoded)  # top level module-qualified
+        refs_json = encoded["dataclass:refs"]
+        self.assertEqual(
+            refs_json["server"],
+            [{"name": "a", "port": 80, "proto": "tcp"}],
+        )
+        self.assertEqual(refs_json["ratio"], "1.25")  # decimal64 -> string
+        self.assertEqual(refs_json["big"], "9223372036854775808")  # uint64 -> string
+        self.assertEqual(refs_json["blob"], "AQI=")  # binary -> base64
+        self.assertEqual(refs_json["present"], [None])  # empty -> [null]
+        # identityref canonicalised by module *name*, not prefix
+        self.assertEqual(encoded["dataclass:box"]["pet"], "dataclass:dog")
+        # bits -> space-joined set-bit names (alpha+gamma default to true)
+        self.assertEqual(encoded["dataclass:box"]["bits-with-default"], "alpha gamma")
+
+    def test_unset_and_empty_are_omitted(self):
+        encoded = self.bindings.to_ietf_json(self.bindings.Dataclass())
+        # refs is entirely unset -> omitted; box holds only YANG defaults
+        self.assertNotIn("dataclass:refs", encoded)
+        self.assertNotIn("plain-before", encoded.get("dataclass:box", {}))
+
+    def test_round_trip(self):
+        import decimal
+
+        refs = self.tree.refs
+        refs.server = [
+            self.bindings.Dataclass.Refs.Server(name="a", port=80, proto="tcp"),
+            self.bindings.Dataclass.Refs.Server(name="b", port=443, proto="udp"),
+        ]
+        refs.active_server = "b"
+        refs.tags = ["x"]
+        refs.udp_port = 9
+        refs.ratio = decimal.Decimal("2.50")
+        refs.big = 18446744073709551615
+        refs.blob = b"hello"
+        refs.present = True
+        self.tree.box.pet = "dog"
+        self.tree.box.mood = "happy"
+        self.tree.box.bits_with_default.beta = True
+
+        encoded = self.bindings.to_ietf_json(self.tree)
+        decoded = self.bindings.from_ietf_json(
+            self.bindings.Dataclass, encoded
+        )
+        self.assertEqual(decoded, self.tree)
+
+    def test_decode_accepts_bare_names(self):
+        decoded = self.bindings.from_ietf_json(
+            self.bindings.Dataclass, {"box": {"plain-before": "hi"}}
+        )
+        self.assertEqual(decoded.box.plain_before, "hi")
+
+    def test_decode_unknown_member_raises(self):
+        with self.assertRaises(ValueError):
+            self.bindings.from_ietf_json(self.bindings.Dataclass, {"nope": 1})
+
+    def test_decode_validates_on_assignment(self):
+        with self.assertRaises(self.bindings.YangValidationError):
+            self.bindings.from_ietf_json(
+                self.bindings.Dataclass,
+                {"box": {"number-with-default": 5}},  # below range 10..4096
+            )
+
+    def test_serde_without_validation(self):
+        bindings = generate("--dataclass-serde", "--no-dataclass-validation")
+        self.assertFalse(hasattr(bindings, "YangValidationError"))
+        tree = bindings.Dataclass()
+        tree.refs.tags = ["a"]
+        encoded = bindings.to_ietf_json(tree)
+        self.assertEqual(encoded["dataclass:refs"]["tags"], ["a"])
+        self.assertEqual(bindings.from_ietf_json(bindings.Dataclass, encoded), tree)
+
+    def test_off_by_default(self):
+        self.assertFalse(hasattr(generate(), "to_ietf_json"))
+
+
 class DataclassNoDefaultsTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

@@ -86,6 +86,21 @@ class additionally carries schema metadata in ClassVars -- invisible to
 - ``_yang_choices`` -- choice name -> mandatory flag, for the choices
   flattened into the class
 
+Serialisation (opt-in with ``--dataclass-serde``)
+    Generates ``to_ietf_json(root)`` / ``from_ietf_json(cls, data)``
+    module functions implementing RFC 7951 (JSON encoding of YANG data)
+    over plain dicts: member names module-qualified at the top level and
+    at module boundaries, 64-bit integers and decimal64 as JSON strings,
+    ``empty`` as ``[null]``, binary as base64, bits as the space-joined
+    set-bit names, identityrefs canonicalised to ``module-name:identity``.
+    Decoding accepts qualified and bare member names and coerces the
+    string encodings back; values flow through normal assignment, so
+    on-assignment validation applies when generated. Limitations: a
+    present-but-empty presence container does not round-trip (the
+    dataclass shape cannot express container absence), and union members
+    are encoded by their Python value type (a 64-bit integer union member
+    is emitted as a JSON number).
+
 Origin comments (opt-in with ``--dataclass-origin-comments``)
     Augment-heavy schemas (FRR's, for one) make it genuinely hard to see
     where a generated node comes from. With this flag, every class/field
@@ -176,6 +191,7 @@ class _FieldMeta:
     cls: type | None = None  # nested/bits class of container/list/bits fields
     check: typing.Any = None  # _Check, when validation is generated
     encode: str | None = None  # IETF-JSON value encoding tag, when special
+    identity_map: typing.Any = None  # identityref spelling -> RFC 7951 canonical
     mandatory: bool = False
     presence: bool = False  # presence container
     min_elements: int | None = None
@@ -513,6 +529,144 @@ def validate_tree(*roots):
 '''
 
 
+# Serialisation runtime, embedded with --dataclass-serde. Driven entirely
+# by the _FieldMeta tables; stdlib-only. Errors raise ValueError (of which
+# YangValidationError, when generated, is a subclass) so callers can catch
+# uniformly whether or not validation is generated.
+_SERDE_RUNTIME = '''
+def _qualified_name(meta, parent_module):
+    return (
+        meta.yang_name
+        if meta.module == parent_module
+        else "%s:%s" % (meta.module, meta.yang_name)
+    )
+
+
+def _encode_value(meta, value):
+    if meta.cls is not None and isinstance(value, meta.cls):
+        # a bits dataclass -> RFC 7951 space-separated set-bit names
+        table = getattr(meta.cls, "_yang_fields", {})
+        return " ".join(m.yang_name for f, m in table.items() if getattr(value, f))
+    if meta.encode == "int64":
+        return str(value)  # RFC 7951: 64-bit ints are JSON strings
+    if meta.encode == "decimal":
+        return str(value)
+    if meta.encode == "empty":
+        return [None]
+    if meta.encode == "binary" and isinstance(value, (bytes, bytearray)):
+        return base64.b64encode(bytes(value)).decode("ascii")
+    if meta.encode == "identityref" and meta.identity_map is not None:
+        return meta.identity_map.get(value, value)
+    if meta.encode == "bits" and isinstance(value, (set, frozenset)):
+        return " ".join(sorted(value))
+    if isinstance(value, decimal.Decimal):
+        return str(value)
+    return value
+
+
+def to_ietf_json(root):
+    """RFC 7951 (JSON encoding of YANG data) representation of a bindings
+    tree, as a plain dict ready for json.dumps(). Unset leaves and empty
+    non-presence containers are omitted; member names are qualified with
+    the module name at the top level and wherever the module changes.
+    Limitations: a present-but-empty presence container is omitted (the
+    dataclass shape cannot express container absence), and union members
+    are encoded by their Python value type."""
+
+    def encode_node(node, parent_module):
+        out = {}
+        for fname, meta in getattr(type(node), "_yang_fields", {}).items():
+            value = getattr(node, fname, None)
+            key = _qualified_name(meta, parent_module)
+            if meta.kind == "container":
+                if value is not None:
+                    child = encode_node(value, meta.module)
+                    if child:
+                        out[key] = child
+            elif meta.kind == "list":
+                entries = [encode_node(entry, meta.module) for entry in value or []]
+                if entries:
+                    out[key] = entries
+            elif meta.kind == "leaf-list":
+                if value:
+                    out[key] = [_encode_value(meta, element) for element in value]
+            elif meta.kind == "leaf":
+                if meta.cls is not None and isinstance(value, meta.cls):
+                    if value:  # bits: present iff any bit is set
+                        out[key] = _encode_value(meta, value)
+                elif value is not None:
+                    out[key] = _encode_value(meta, value)
+        return out
+
+    return encode_node(root, None)
+
+
+def _decode_value(meta, value):
+    if meta.cls is not None and isinstance(value, str):
+        # a bits leaf: space-separated bit names -> bits dataclass
+        names = set(value.split())
+        table = getattr(meta.cls, "_yang_fields", {})
+        return meta.cls(**{f: True for f, m in table.items() if m.yang_name in names})
+    if meta.encode == "int64" and isinstance(value, str):
+        return int(value)
+    if meta.encode == "decimal":
+        return decimal.Decimal(str(value))
+    if meta.encode == "empty":
+        return True  # [null] -> presence
+    if meta.encode == "binary" and isinstance(value, str):
+        return base64.b64decode(value)
+    if meta.encode == "identityref" and isinstance(value, str) and meta.identity_map:
+        if value in meta.identity_map:
+            return value  # already an accepted spelling
+        accepted = [k for k, v in meta.identity_map.items() if v == value]
+        if accepted:
+            # prefer the bare spelling over the prefixed one
+            return min(accepted, key=lambda s: (":" in s, s))
+    return value
+
+
+def from_ietf_json(cls, data):
+    """Build a bindings tree of type `cls` from an RFC 7951 dict (the
+    shape json.load() gives). Member names are accepted both module-
+    qualified and bare; unknown members raise ValueError. Values flow
+    through normal attribute assignment, so on-assignment validation
+    (when generated) applies; run validate_tree() afterwards for
+    structural/referential checks."""
+    node = cls()
+    _decode_into(node, data)
+    return node
+
+
+def _decode_into(node, data):
+    fields = getattr(type(node), "_yang_fields", {})
+    by_name = {}
+    for fname, meta in fields.items():
+        by_name["%s:%s" % (meta.module, meta.yang_name)] = (fname, meta)
+        by_name.setdefault(meta.yang_name, (fname, meta))
+    for key, value in data.items():
+        try:
+            fname, meta = by_name[key]
+        except KeyError:
+            raise ValueError(
+                "%s has no member %r" % (type(node).__name__, key)
+            ) from None
+        if meta.kind == "container":
+            _decode_into(getattr(node, fname), value)
+        elif meta.kind == "list":
+            entries = []
+            for item in value:
+                entry = meta.cls()
+                _decode_into(entry, item)
+                entries.append(entry)
+            setattr(node, fname, entries)
+        elif meta.kind == "leaf-list":
+            setattr(node, fname, [_decode_value(meta, element) for element in value])
+        else:
+            setattr(node, fname, _decode_value(meta, value))
+    return node
+'''
+
+
 def pyang_plugin_init():
     plugin.register_plugin(PybindDataclassPlugin())
 
@@ -533,6 +687,15 @@ class PybindDataclassPlugin(plugin.PyangPlugin):
             "restrictions (ranges, lengths, patterns, enum/identity "
             "values, bits, unions) into the dataclasses "
             "(validation is generated by default)",
+        )
+        group.add_option(
+            "--dataclass-serde",
+            dest="dataclass_serde",
+            action="store_true",
+            default=False,
+            help="Generate to_ietf_json()/from_ietf_json() functions "
+            "(RFC 7951 JSON encoding of YANG data, as plain dicts) into "
+            "the module",
         )
         group.add_option(
             "--dataclass-origin-comments",
@@ -565,6 +728,7 @@ class PybindDataclassPlugin(plugin.PyangPlugin):
             with_validation=not getattr(ctx.opts, "no_dataclass_validation", False),
             with_defaults=not getattr(ctx.opts, "no_dataclass_defaults", False),
             with_origin_comments=getattr(ctx.opts, "dataclass_origin_comments", False),
+            with_serde=getattr(ctx.opts, "dataclass_serde", False),
         )
 
 
@@ -587,8 +751,11 @@ def class_name(yang_name):
 
 
 def _build_identity_values(ctx):
-    """Map each identity statement -> sorted value spellings of everything
-    transitively derived from it (bare and module-prefixed)."""
+    """Map each identity statement -> (sorted value spellings of everything
+    transitively derived from it, spelling -> RFC 7951 canonical
+    `module-name:identity` map). Spellings cover bare and module-prefixed
+    forms; the canonical form qualifies by module *name* (RFC 7951), which
+    is not necessarily the prefix."""
     identities = {}  # id(stmt) -> stmt, dedupes multiple ctx.modules entries
     for module in ctx.modules.values():
         for ident in module.search("identity"):
@@ -608,17 +775,23 @@ def _build_identity_values(ctx):
         yield ident.arg
 
     values = {}
+    canonical = {}
     for base_id in list(direct_derived):
         seen, out, stack = set(), set(), list(direct_derived.get(base_id, []))
+        canon = {}
         while stack:
             ident = stack.pop()
             if id(ident) in seen:
                 continue
             seen.add(id(ident))
-            out.update(spellings(ident))
+            rfc7951 = "%s:%s" % (_Emitter._module_name(ident), ident.arg)
+            for spelling in spellings(ident):
+                out.add(spelling)
+                canon[spelling] = rfc7951
             stack.extend(direct_derived.get(id(ident), []))
         values[base_id] = sorted(out)
-    return values
+        canonical[base_id] = canon
+    return values, canonical
 
 
 def _parse_bound(text):
@@ -648,16 +821,17 @@ def _parse_range_arg(arg):
 class _Emitter:
     def __init__(
         self, ctx, identity_values, with_validation, with_defaults,
-        with_origin_comments=False,
+        with_origin_comments=False, with_serde=False, identity_canonical=None,
     ):
         self.ctx = ctx
         self.identity_values = identity_values
+        self.identity_canonical = identity_canonical or {}
         self.with_validation = with_validation
         self.with_defaults = with_defaults
         self.with_origin_comments = with_origin_comments
-        # The schema metadata table is emitted whenever some feature needs
-        # it (today only validation; serialisation/xpaths will extend this).
-        self.with_meta = with_validation
+        self.with_serde = with_serde
+        # The schema metadata table is emitted whenever some feature needs it.
+        self.with_meta = with_validation or with_serde
         # Names of the modules classes are emitted for; leafrefs whose
         # target lies outside these trees cannot be checked and get no
         # `leafref` metadata. Filled in by build_dataclasses.
@@ -886,6 +1060,41 @@ class _Emitter:
             return "bits"
         return None
 
+    def _identityref_map_name(self, type_stmt, node, depth=0):
+        """For an identityref leaf (possibly via typedefs/leafref): the name
+        of a hoisted module-level dict mapping every accepted spelling to
+        the RFC 7951 canonical `module-name:identity` form. None when not
+        an identityref (or serde is off)."""
+        if not self.with_serde or depth > 16:
+            return None
+        t = self._resolve_typedef_chain(type_stmt)
+        if t.arg == "leafref":
+            target = self._leafref_target(node, depth)
+            if target is None:
+                return None
+            return self._identityref_map_name(target.search_one("type"), target, depth + 1)
+        if t.arg != "identityref":
+            return None
+        base = t.search_one("base")
+        identity = getattr(base, "i_identity", None) if base is not None else None
+        if identity is None:
+            return None
+        mapping = self.identity_canonical.get(id(identity))
+        if not mapping:
+            return None
+
+        def build(name):
+            lines = ["%s = {" % name]
+            lines.extend("    %r: %r," % (k, mapping[k]) for k in sorted(mapping))
+            lines.append("}")
+            return lines
+
+        return self._register_reusable(
+            ("identity-map", id(identity)),
+            "_%sIdentities" % class_name(identity.arg),
+            build,
+        )
+
     def field_meta_expr(self, child, case, cls_name=None):
         """`_FieldMeta(...)` constructor source for one field."""
         kind = child.keyword
@@ -900,6 +1109,9 @@ class _Emitter:
             encode = self._encode_tag(child.search_one("type"), child)
             if encode is not None:
                 args.append("encode=%r" % encode)
+            identity_map = self._identityref_map_name(child.search_one("type"), child)
+            if identity_map is not None:
+                args.append("identity_map=%s" % identity_map)
             leafref = self._leafref_path(child)
             if leafref is not None:
                 args.append("leafref=%r" % leafref)
@@ -1287,13 +1499,14 @@ class _Emitter:
 
 def build_dataclasses(
     ctx, modules, fd, with_validation=True, with_defaults=True,
-    with_origin_comments=False,
+    with_origin_comments=False, with_serde=False,
 ):
-    identity_values = _build_identity_values(ctx)
+    identity_values, identity_canonical = _build_identity_values(ctx)
 
     emitter = _Emitter(
         ctx, identity_values, with_validation, with_defaults,
-        with_origin_comments=with_origin_comments,
+        with_origin_comments=with_origin_comments, with_serde=with_serde,
+        identity_canonical=identity_canonical,
     )
     # Reserve the top-level module class names so a reusable type (emitted in
     # the same module namespace) can never shadow one of them.
@@ -1309,7 +1522,8 @@ def build_dataclasses(
         '"""Typed dataclass bindings generated by pyangbind (pybind-dataclass plugin).',
         "",
         "Source YANG modules: %s." % ", ".join(sorted(m.arg for m in modules)),
-        "Generated with: validation=%s, defaults=%s." % (with_validation, with_defaults),
+        "Generated with: validation=%s, defaults=%s, serde=%s."
+        % (with_validation, with_defaults, with_serde),
         "Do not edit by hand -- regenerate instead.",
         '"""',
         "",
@@ -1318,14 +1532,18 @@ def build_dataclasses(
         "import dataclasses",
         "import typing",
     ]
+    if with_serde:
+        header.append("import base64")
     if with_validation:
         header.append("import re")
-    if emitter.uses_decimal or with_validation:
+    if emitter.uses_decimal or with_validation or with_serde:
         header.append("import decimal")
     if emitter.with_meta:
         header.append(_META_RUNTIME.rstrip())
     if with_validation:
-        header.append(_VALIDATION_RUNTIME)
+        header.append(_VALIDATION_RUNTIME.rstrip())
+    if with_serde:
+        header.append(_SERDE_RUNTIME.rstrip())
     header.extend(["", ""])
 
     # Reusable types (Literal aliases, bits dataclasses) go between the
