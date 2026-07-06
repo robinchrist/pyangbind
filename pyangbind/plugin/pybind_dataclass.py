@@ -117,6 +117,25 @@ Serialisation (opt-in with ``--dataclass-serde``)
     are encoded by their Python value type (a 64-bit integer union member
     is emitted as a JSON number).
 
+Metadata annotations (disable with ``--no-dataclass-annotations``)
+    RFC 7952 ``md:annotation`` statements found anywhere in the
+    compilation set are registered (``_YANG_ANNOTATIONS``), and instances
+    can carry annotation values as metadata -- invisible to
+    ``__init__``/``repr``/``==``, stored in a per-instance
+    ``_yang_metadata`` dict. ``annotate(node, comment="...")`` annotates
+    the node itself (container / list entry / module root);
+    ``annotate(node, "leaf_field", comment="...")`` a scalar leaf member
+    (container/list members are annotated on the child object itself);
+    ``annotate(node, "leaflist_field", i, comment="...")`` the i-th
+    leaf-list entry (RFC 7952: annotations attach to individual entries,
+    never a whole leaf-list). ``annotations(...)`` with the same
+    addressing reads them back. Values are validated against the
+    annotation's YANG type when validation is generated, and serde
+    round-trips them per RFC 7952 section 5.2: a ``"@"`` metadata-object
+    member inside container/list-entry objects, a sibling ``"@member"``
+    object for leaves, a null-padded ``"@member"`` array for leaf-list
+    entries, annotation names always ``module-name:name``-qualified.
+
 XPaths (opt-in with ``--dataclass-xpaths``)
     Every generated class gets its absolute schema path as a
     ``_yang_schema_path`` ClassVar (module-name-qualified at the top and
@@ -290,6 +309,99 @@ def _instance_key(entry, meta):
         yang_key = key_meta.yang_name if key_meta is not None else key
         parts.append("%s=%r" % (yang_key, getattr(entry, key, None)))
     return ",".join(parts)
+
+
+@dataclasses.dataclass(frozen=True)
+class _AnnotationDef:
+    """One RFC 7952 metadata annotation (md:annotation) defined by the
+    compiled schema set."""
+
+    yang_name: str
+    module: str  # defining module name (the RFC 7952 qualifier)
+    check: typing.Any = None  # _Check, when validation is generated
+    encode: str | None = None  # IETF-JSON value encoding tag, when special
+
+
+# python-safe annotation name -> _AnnotationDef. Populated by generated
+# code when the compiled modules define md:annotation statements (and
+# --no-dataclass-annotations was not given); empty otherwise, in which
+# case annotate() rejects every annotation name.
+_YANG_ANNOTATIONS: dict = {}
+
+
+def annotate(node, member=None, index=None, /, **values):
+    """Attach RFC 7952 metadata annotations to a data node instance.
+
+    ``annotate(node, comment="...")`` annotates the node itself (a
+    container / list entry / module root). ``annotate(node, "field",
+    comment="...")`` annotates the scalar leaf member ``field`` of
+    ``node`` -- a container or list member is annotated on the child
+    object itself, never through its parent. ``annotate(node, "field",
+    i, comment="...")`` annotates the i-th entry of leaf-list member
+    ``field`` (RFC 7952: annotations attach to individual leaf-list
+    entries, never the whole leaf-list). Keyword names are the
+    python-safe annotation names; a value of ``None`` removes that
+    annotation. Values are validated against the annotation's YANG
+    type when validation is generated. Returns ``node``."""
+    fields = getattr(type(node), "_yang_fields", {})
+    if member is None:
+        if index is not None:
+            raise ValueError("index given without a leaf-list member")
+        key = None
+    else:
+        meta = fields.get(member)
+        if meta is None:
+            raise ValueError("%s has no member %r" % (type(node).__name__, member))
+        if meta.kind == "leaf":
+            if index is not None:
+                raise ValueError(
+                    "%r is a leaf; an entry index applies only to leaf-list members"
+                    % (member,)
+                )
+            key = member
+        elif meta.kind == "leaf-list":
+            if index is None:
+                raise ValueError(
+                    "leaf-list member %r needs an entry index (RFC 7952: "
+                    "annotations attach to individual leaf-list entries)" % (member,)
+                )
+            key = (member, index)
+        else:
+            raise ValueError(
+                "%r is a %s member; annotate the child object itself"
+                % (member, meta.kind)
+            )
+    store = getattr(node, "_yang_metadata", None)
+    if store is None:
+        store = {}
+        object.__setattr__(node, "_yang_metadata", store)
+    entry = store.setdefault(key, {})
+    for name, value in values.items():
+        adef = _YANG_ANNOTATIONS.get(name)
+        if adef is None:
+            raise ValueError(
+                "no annotation named %r is defined by the compiled modules" % (name,)
+            )
+        if value is None:
+            entry.pop(name, None)
+        elif adef.check is not None:
+            adef.check.validate(value, "@%s:%s" % (adef.module, adef.yang_name))
+            entry[name] = value
+        else:
+            entry[name] = value
+    if not entry:
+        store.pop(key, None)
+    return node
+
+
+def annotations(node, member=None, index=None, /):
+    """The RFC 7952 annotations attached to a node instance, one of its
+    leaf members, or one leaf-list member entry (same addressing as
+    annotate()), as a dict of python-safe annotation name -> value.
+    Returns {} when there are none."""
+    store = getattr(node, "_yang_metadata", None) or {}
+    key = member if index is None else (member, index)
+    return dict(store.get(key) or {})
 '''
 
 # XPath evaluator embedded alongside the validation runtime: evaluates the
@@ -1223,18 +1335,54 @@ def _encode_value(meta, value):
     return value
 
 
+def _encode_annotation_value(adef, value):
+    """RFC 7952 5.2.1: an annotation value is encoded exactly like a
+    leaf of the same type."""
+    if adef.encode == "int64":
+        return str(value)
+    if adef.encode == "decimal":
+        return str(value)
+    if adef.encode == "binary" and isinstance(value, (bytes, bytearray)):
+        return base64.b64encode(bytes(value)).decode("ascii")
+    if isinstance(value, decimal.Decimal):
+        return str(value)
+    return value
+
+
+def _encode_metadata(entry):
+    """One RFC 7952 metadata object: annotation values keyed by the
+    always-qualified `module-name:annotation` form (RFC 7952 5.2.1)."""
+    out = {}
+    for name, value in entry.items():
+        adef = _YANG_ANNOTATIONS.get(name)
+        if adef is None:
+            raise ValueError("unknown annotation %r attached to a node" % (name,))
+        out["%s:%s" % (adef.module, adef.yang_name)] = _encode_annotation_value(
+            adef, value
+        )
+    return out
+
+
 def to_ietf_json(root):
     """RFC 7951 (JSON encoding of YANG data) representation of a bindings
     tree, as a plain dict ready for json.dumps(). Unset leaves and empty
     non-presence containers are omitted; member names are qualified with
     the module name at the top level and wherever the module changes.
-    Limitations: a present-but-empty presence container is omitted (the
-    dataclass shape cannot express container absence), and union members
-    are encoded by their Python value type."""
+    RFC 7952 annotations (see annotate()) are encoded per its section
+    5.2: a "@" metadata-object member inside container / list-entry
+    objects, a sibling "@member" object for annotated leaf members, and
+    a null-padded "@member" array for annotated leaf-list entries --
+    but only where the annotated instance is itself encoded (metadata
+    on unset leaves, or on leaf-list indexes past the end of the list,
+    is dropped). Limitations: a present-but-empty presence container is
+    omitted (the dataclass shape cannot express container absence)
+    unless annotated, and union members are encoded by their Python
+    value type."""
 
     def encode_node(node, parent_module):
         out = {}
-        for fname, meta in getattr(type(node), "_yang_fields", {}).items():
+        fields = getattr(type(node), "_yang_fields", {})
+        for fname, meta in fields.items():
             value = getattr(node, fname, None)
             key = _qualified_name(meta, parent_module)
             if meta.kind == "container":
@@ -1255,6 +1403,29 @@ def to_ietf_json(root):
                         out[key] = _encode_value(meta, value)
                 elif value is not None:
                     out[key] = _encode_value(meta, value)
+        store = getattr(node, "_yang_metadata", None) or {}
+        if store.get(None):
+            out["@"] = _encode_metadata(store[None])
+        for skey, entry in store.items():
+            if skey is None or not entry:
+                continue
+            fname = skey[0] if isinstance(skey, tuple) else skey
+            meta = fields.get(fname)
+            if meta is None:
+                continue
+            key = _qualified_name(meta, parent_module)
+            if key not in out:
+                continue  # metadata on an unset member is dropped
+            if meta.kind == "leaf":
+                out["@" + key] = _encode_metadata(entry)
+            elif meta.kind == "leaf-list":
+                index = skey[1]
+                if index >= len(out[key]):
+                    continue  # dangling entry index
+                array = out.setdefault("@" + key, [])
+                if len(array) <= index:
+                    array.extend([None] * (index + 1 - len(array)))
+                array[index] = _encode_metadata(entry)
         return out
 
     return encode_node(root, None)
@@ -1289,13 +1460,41 @@ def _decode_value(meta, value):
 def from_ietf_json(cls, data):
     """Build a bindings tree of type `cls` from an RFC 7951 dict (the
     shape json.load() gives). Member names are accepted both module-
-    qualified and bare; unknown members raise ValueError. Values flow
-    through normal attribute assignment, so on-assignment validation
-    (when generated) applies; run validate_tree() afterwards for
-    structural/referential checks."""
+    qualified and bare; unknown members raise ValueError. RFC 7952
+    metadata members ("@" / "@member", section 5.2) are decoded into
+    annotations (see annotate()); unknown annotation names raise
+    ValueError. Values flow through normal attribute assignment, so
+    on-assignment validation (when generated) applies; run
+    validate_tree() afterwards for structural/referential checks."""
     node = cls()
     _decode_into(node, data)
     return node
+
+
+def _decode_annotation_value(adef, value):
+    if adef.encode == "int64" and isinstance(value, str):
+        return int(value)
+    if adef.encode == "decimal":
+        return decimal.Decimal(str(value))
+    if adef.encode == "binary" and isinstance(value, str):
+        return base64.b64decode(value)
+    return value
+
+
+def _apply_metadata(node, member, index, obj):
+    """Decode one RFC 7952 metadata object onto a node / leaf member /
+    leaf-list entry. Annotation names must be the qualified
+    `module-name:annotation` form (RFC 7952 5.2.1); the bare name is
+    accepted leniently when unambiguous."""
+    values = {}
+    for key, value in obj.items():
+        for pyname, adef in _YANG_ANNOTATIONS.items():
+            if key in ("%s:%s" % (adef.module, adef.yang_name), adef.yang_name):
+                values[pyname] = _decode_annotation_value(adef, value)
+                break
+        else:
+            raise ValueError("unknown metadata annotation %r" % (key,))
+    annotate(node, member, index, **values)
 
 
 def _decode_into(node, data):
@@ -1304,7 +1503,13 @@ def _decode_into(node, data):
     for fname, meta in fields.items():
         by_name["%s:%s" % (meta.module, meta.yang_name)] = (fname, meta)
         by_name.setdefault(meta.yang_name, (fname, meta))
+    metadata = []
     for key, value in data.items():
+        if key.startswith("@"):
+            # RFC 7952 metadata member; deferred until the data members
+            # (in particular annotated leaf-lists) have been decoded.
+            metadata.append((key, value))
+            continue
         try:
             fname, meta = by_name[key]
         except KeyError:
@@ -1324,6 +1529,28 @@ def _decode_into(node, data):
             setattr(node, fname, [_decode_value(meta, element) for element in value])
         else:
             setattr(node, fname, _decode_value(meta, value))
+    for key, value in metadata:
+        if key == "@":
+            _apply_metadata(node, None, None, value)
+            continue
+        try:
+            fname, meta = by_name[key[1:]]
+        except KeyError:
+            raise ValueError(
+                "%s has no member %r to annotate" % (type(node).__name__, key[1:])
+            ) from None
+        if meta.kind == "leaf":
+            _apply_metadata(node, fname, None, value)
+        elif meta.kind == "leaf-list":
+            for index, obj in enumerate(value):
+                if obj:  # null = no annotations on this entry
+                    _apply_metadata(node, fname, index, obj)
+        else:
+            raise ValueError(
+                "%s: %r -- container/list-entry metadata goes inside the "
+                "object as '@' (RFC 7952 5.2.2), not on the parent"
+                % (type(node).__name__, key)
+            )
     return node
 '''
 
@@ -1442,6 +1669,17 @@ class PybindDataclassPlugin(plugin.PyangPlugin):
             "(must/when evaluation is generated by default)",
         )
         group.add_option(
+            "--no-dataclass-annotations",
+            dest="no_dataclass_annotations",
+            action="store_true",
+            default=False,
+            help="Ignore RFC 7952 md:annotation statements in the "
+            "compiled modules: no annotation registry is generated, so "
+            "annotate()/annotations() reject every annotation name and "
+            "serde rejects '@' metadata members "
+            "(annotation support is generated by default)",
+        )
+        group.add_option(
             "--no-dataclass-defaults",
             dest="no_dataclass_defaults",
             action="store_true",
@@ -1465,6 +1703,7 @@ class PybindDataclassPlugin(plugin.PyangPlugin):
             with_serde=getattr(ctx.opts, "dataclass_serde", False),
             with_xpaths=getattr(ctx.opts, "dataclass_xpaths", False),
             split_dir=getattr(ctx.opts, "dataclass_split_dir", None),
+            with_annotations=not getattr(ctx.opts, "no_dataclass_annotations", False),
         )
 
 
@@ -1651,6 +1890,11 @@ class _Emitter:
         self.reusable_lines = []
         self.reusable_by_key = {}  # dedup key -> assigned Python name
         self.reusable_names = set()  # every assigned name, for collision avoidance
+        # The `_YANG_ANNOTATIONS.update({...})` source registering the
+        # compiled modules' RFC 7952 md:annotation statements; emitted
+        # after the reusable types. Empty when there are none (or
+        # --no-dataclass-annotations was given).
+        self.annotation_lines = []
 
     def _register_reusable(self, key, preferred_name, build_lines):
         """Register (once) a module-level reusable type. `key` dedups repeated
@@ -2033,6 +2277,41 @@ class _Emitter:
             if whens:
                 args.append("whens=%r" % (whens,))
         return "_FieldMeta(%s)" % ", ".join(args)
+
+    def emit_annotation_registry(self, annotation_stmts):
+        """`_YANG_ANNOTATIONS.update({...})` source registering every RFC
+        7952 md:annotation statement found in the compiled modules, keyed
+        by python-safe annotation name (module-prefixed on the rare name
+        collision between two modules). The value type gets the same
+        check/encode treatment as a leaf of that type; an unresolvable
+        type just means the value is accepted unvalidated, never
+        misjudged."""
+        entries = []
+        taken = set()
+        for module, stmt in annotation_stmts:
+            name = safe_name(stmt.arg)
+            if name in taken:
+                name = safe_name("%s_%s" % (module.arg, stmt.arg))
+            taken.add(name)
+            args = ["yang_name=%r" % stmt.arg, "module=%r" % self._module_name(module)]
+            type_stmt = stmt.search_one("type")
+            if type_stmt is not None:
+                if self.with_validation:
+                    check = self.check_expr(type_stmt, stmt)
+                    if check is not None:
+                        args.append("check=%s" % check)
+                encode = self._encode_tag(type_stmt, stmt)
+                if encode is not None:
+                    args.append("encode=%r" % encode)
+            entries.append((name, "_AnnotationDef(%s)" % ", ".join(args)))
+        self.annotation_lines.append(
+            "# RFC 7952 metadata annotations defined by the compiled modules"
+        )
+        self.annotation_lines.append("_YANG_ANNOTATIONS.update({")
+        for name, expr in entries:
+            self.annotation_lines.append("    %r: %s," % (name, expr))
+        self.annotation_lines.append("})")
+        self.annotation_lines.append("")
 
     @staticmethod
     def _literal(values):
@@ -2421,10 +2700,28 @@ class _Emitter:
         self.lines.append("")
 
 
+def _collect_annotation_stmts(ctx):
+    """Every RFC 7952 md:annotation statement in the compilation set, as
+    (defining module, statement) pairs in a stable order. Scans all
+    modules pyang loaded (like identities), so annotations defined by an
+    imported module are registered too."""
+    seen = set()
+    found = []
+    for module in ctx.modules.values():
+        if id(module) in seen:
+            continue
+        seen.add(id(module))
+        for stmt in module.substmts:
+            if stmt.keyword == ("ietf-yang-metadata", "annotation"):
+                found.append((module, stmt))
+    found.sort(key=lambda pair: (pair[0].arg, pair[1].arg))
+    return found
+
+
 def build_dataclasses(
     ctx, modules, fd, with_validation=True, with_defaults=True,
     with_origin_comments=False, with_serde=False, with_xpaths=False,
-    split_dir=None, with_must_when=True,
+    split_dir=None, with_must_when=True, with_annotations=True,
 ):
     identity_values, identity_canonical = _build_identity_values(ctx)
 
@@ -2439,6 +2736,10 @@ def build_dataclasses(
     emitter.reusable_names.update(class_name(m.arg) for m in modules)
     data_modules = [m for m in modules if _Emitter._data_children(m)]
     emitter.emitted_module_names = {m.arg for m in data_modules}
+    if with_annotations and emitter.with_meta:
+        annotation_stmts = _collect_annotation_stmts(ctx)
+        if annotation_stmts:
+            emitter.emit_annotation_registry(annotation_stmts)
     segments = []  # (module, its slice of emitter.lines), for split mode
     for module in data_modules:
         start = len(emitter.lines)
@@ -2492,7 +2793,8 @@ def build_dataclasses(
     # Reusable types (Literal aliases, bits dataclasses) go between the
     # imports/runtime and the tree classes so forward references resolve and
     # bits classes exist before they are used as field factory defaults.
-    body = emitter.reusable_lines + emitter.lines
+    # The annotation registry follows them (it may reference _Check).
+    body = emitter.reusable_lines + emitter.annotation_lines + emitter.lines
     fd.write("\n".join(header + body))
     if not body or body[-1] != "":
         fd.write("\n")
@@ -2552,26 +2854,31 @@ def _write_split_package(
         write("_runtime.py", header + runtime_blocks + [""])
 
     # Names generated code may reference from _runtime, private + public.
-    runtime_private = (["_FieldMeta"] if emitter.with_meta else []) + (
-        ["_Check", "_YangNode"] if with_validation else []
-    )
+    runtime_private = (
+        ["_FieldMeta", "_AnnotationDef", "_YANG_ANNOTATIONS"]
+        if emitter.with_meta
+        else []
+    ) + (["_Check", "_YangNode"] if with_validation else [])
     runtime_public = (
         (["YangValidationError", "validate_tree"] if with_validation else [])
         + (["to_ietf_json", "from_ietf_json"] if with_serde else [])
         + (["data_path"] if with_xpaths else [])
+        + (["annotate", "annotations"] if emitter.annotation_lines else [])
     )
 
     reusable_names = list(emitter.reusable_by_key.values())
-    if reusable_names:
+    types_lines = emitter.reusable_lines + emitter.annotation_lines
+    if types_lines:
         header = [
             '"""Reusable types shared by the generated bindings package',
-            "(type aliases, bits dataclasses, identityref spelling maps).",
+            "(type aliases, bits dataclasses, identityref spelling maps,",
+            "the RFC 7952 annotation registry).",
             '"""',
             "",
             "import dataclasses",
             "import typing",
         ]
-        from_runtime = needed(emitter.reusable_lines, runtime_private)
+        from_runtime = needed(types_lines, runtime_private)
         if from_runtime:
             header.append("from ._runtime import %s" % ", ".join(from_runtime))
         header += [
@@ -2581,7 +2888,7 @@ def _write_split_package(
             "]",
             "",
         ]
-        write("_types.py", header + emitter.reusable_lines)
+        write("_types.py", header + types_lines)
 
     module_files = {}  # module file stem -> root class name
     for module, lines in segments:
@@ -2616,7 +2923,8 @@ def _write_split_package(
     if runtime_public:
         init.append("from ._runtime import %s" % ", ".join(runtime_public))
         exported += runtime_public
-    if reusable_names:
+    if types_lines:
+        # Also executes the RFC 7952 annotation-registry population.
         init.append("from ._types import *  # noqa: F401,F403")
         exported += reusable_names
     for stem, cname in module_files.items():
