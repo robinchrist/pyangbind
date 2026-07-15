@@ -693,10 +693,17 @@ class DataclassXsdPatternTests(unittest.TestCase):
         finally:
             sys.path.pop(0)
         self.assertEqual(_python_pattern("[a-z]+"), "[a-z]+")  # untouched
+        # inside a character class: ASCII approximations (zone-ids)
         self.assertEqual(
             _python_pattern(r"(%[\p{N}\p{L}]+)?"), "(%[0-9A-Za-z]+)?"
         )
-        self.assertEqual(_python_pattern(r"\p{Lu}\p{Nd}*"), "[A-Z][0-9]*")
+        # outside a class: Unicode-correct spellings where they exist
+        # (libyang matches the full categories) ...
+        self.assertEqual(_python_pattern(r"\p{L}+"), r"[^\W\d_]+")
+        self.assertEqual(_python_pattern(r"\p{Nd}*"), r"\d*")
+        # ... and inexpressible categories drop the pattern instead of
+        # narrowing it to ASCII (unenforced rather than misjudged)
+        self.assertIsNone(_python_pattern(r"\p{Lu}\p{Nd}*"))
         self.assertIsNone(_python_pattern(r"[\P{L}]+"))  # no safe negation
         self.assertIsNone(_python_pattern(r"\p{Zs}"))  # unmapped category
 
@@ -1300,6 +1307,52 @@ class DataclassConformanceTests(unittest.TestCase):
             self.bindings.from_ietf_json(
                 self.bindings.DataclassConformance,
                 {"dataclass-conformance:flags": "b1 b9"},
+            )
+
+    def test_unicode_category_pattern_outside_class(self):
+        self.tree.letters = "äö"  # \p{L} matches all Unicode letters
+        with self.assertRaises(self.bindings.YangValidationError):
+            self.tree.letters = "a1"
+
+    def test_instance_identifier_syntax(self):
+        self.tree.target = "/dcc:srv[name='a'][role='x']/dcc:name"
+        with self.assertRaisesRegex(
+            self.bindings.YangValidationError, "instance-identifier"
+        ):
+            self.tree.target = "not a path"
+
+    def test_predicated_leafref(self):
+        Srv = self.bindings.DataclassConformance.Srv
+        Use = self.bindings.DataclassConformance.Use
+        self.tree.srv = [Srv(name="a", role="db")]
+        self.tree.use = [Use(id="u", want_role="db", pick="a")]
+        self.assertEqual(self._violations(), "")
+        self.tree.srv[0].role = "web"  # predicate no longer selects srv 'a'
+        self.assertIn("leafref has no target instance", self._violations())
+
+    def test_union_string_member_decoding(self):
+        decoded = self.bindings.from_ietf_json(
+            self.bindings.DataclassConformance, {"dataclass-conformance:u": "3.5"}
+        )
+        import decimal as _decimal
+
+        self.assertEqual(decoded.u, _decimal.Decimal("3.5"))
+        decoded = self.bindings.from_ietf_json(
+            self.bindings.DataclassConformance, {"dataclass-conformance:u": "off"}
+        )
+        self.assertEqual(decoded.u, "off")
+        decoded = self.bindings.from_ietf_json(
+            self.bindings.DataclassConformance, {"dataclass-conformance:ub": "x y"}
+        )
+        self.assertEqual(decoded.ub, frozenset({"x", "y"}))
+        # and the bits set round-trips back to the RFC 7951 string form
+        self.assertEqual(
+            self.bindings.to_ietf_json(decoded)["dataclass-conformance:ub"], "x y"
+        )
+        with self.assertRaises(ValueError):
+            self.bindings.from_ietf_json(
+                self.bindings.DataclassConformance,
+                {"dataclass-conformance:u": "9.5"},
             )
 
     def test_empty_presence_container_decode_rejected(self):

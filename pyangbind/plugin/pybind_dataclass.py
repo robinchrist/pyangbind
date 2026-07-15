@@ -257,7 +257,7 @@ _CHECK_BASE = {
     "empty": "bool",
     "binary": "bytes",
     "bits": "bits",
-    "instance-identifier": "str",
+    "instance-identifier": "instance-identifier",
     "decimal64": "decimal",
 }
 
@@ -1059,6 +1059,46 @@ class YangValidationError(ValueError):
     """A value assigned to a generated field violates its YANG type."""
 
 
+_II_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*(?::[A-Za-z_][A-Za-z0-9_.-]*)?")
+
+
+def _instance_identifier_syntax_ok(text):
+    """Purely syntactic RFC 7950 9.13 instance-identifier shape check:
+    an absolute path of /name steps with balanced, quote-respecting
+    [...] predicates. Predicate contents and schema validity are not
+    judged (require-instance semantics need a schema-aware resolver),
+    so this accepts a superset of what libyang accepts -- but rejects
+    values that are not paths at all."""
+    if not text.startswith("/"):
+        return False
+    pos, length = 0, len(text)
+    while pos < length:
+        if text[pos] != "/":
+            return False
+        pos += 1
+        match = _II_NAME_RE.match(text, pos)
+        if match is None:
+            return False
+        pos = match.end()
+        while pos < length and text[pos] == "[":
+            pos += 1
+            quote = None
+            while pos < length:
+                char = text[pos]
+                if quote is not None:
+                    if char == quote:
+                        quote = None
+                elif char == "'" or char == '"':
+                    quote = char
+                elif char == "]":
+                    break
+                pos += 1
+            if pos >= length or text[pos] != "]":
+                return False
+            pos += 1
+    return True
+
+
 @dataclasses.dataclass(frozen=True)
 class _Check:
     """Value-level YANG type restrictions for one leaf/leaf-list field."""
@@ -1136,6 +1176,13 @@ class _Check:
             ok = isinstance(value, (int, float, decimal.Decimal)) and not isinstance(value, bool)
         elif base == "bytes":
             ok = isinstance(value, (bytes, bytearray))
+        elif base == "instance-identifier":
+            ok = isinstance(value, str)
+            if ok and not _instance_identifier_syntax_ok(value):
+                raise YangValidationError(
+                    "%s: %r is not instance-identifier syntax "
+                    "(absolute /module:node[...] path)" % (path, value)
+                )
         elif base == "ipv4-address":
             ok = isinstance(value, ipaddress.IPv4Address)
         elif base == "ipv6-address":
@@ -1523,6 +1570,8 @@ def _encode_value(meta, value):
         return str(value)
     if meta.natives and isinstance(value, meta.natives):
         return str(value)  # a native-hinted member of a union
+    if isinstance(value, (set, frozenset)):
+        return " ".join(sorted(value))  # a bits member of a union
     if isinstance(value, decimal.Decimal):
         return str(value)
     if isinstance(value, _NATIVE_IP_TYPES):
@@ -1628,6 +1677,54 @@ def to_ietf_json(root):
     return encode_node(root, None)
 
 
+def _decode_union_member(members, value):
+    """First union member (in YANG order) that accepts `value` decoded
+    into that member's representation, or None when no member does
+    (the caller then leaves the raw value for on-assignment checking
+    to judge). Only conversions whose RFC 7951 JSON encoding is a
+    string are attempted; a str-typed member keeps the string."""
+    for member in members:
+        base = getattr(member, "base", None)
+        if base == "union":
+            candidate = _decode_union_member(member.members, value)
+            if candidate is not None:
+                return candidate
+            continue
+        if base == "str":
+            candidate = value
+        elif base == "decimal":
+            try:
+                candidate = decimal.Decimal(value)
+            except decimal.InvalidOperation:
+                continue
+        elif base == "bits":
+            candidate = frozenset(value.split())
+        elif base == "bytes":
+            try:
+                candidate = base64.b64decode(value, validate=True)
+            except (ValueError, TypeError):
+                continue
+        elif base == "int":
+            # only 64-bit integers are string-encoded (RFC 7951 6.1);
+            # narrower ints encode as JSON numbers, so a string must
+            # not match them
+            bounds = [b for stmt in member.ranges for pair in stmt for b in pair]
+            if not any(b is not None and abs(b) > 2**32 for b in bounds):
+                continue
+            try:
+                candidate = int(value)
+            except ValueError:
+                continue
+        else:
+            continue
+        try:
+            member.validate(candidate, "")
+            return candidate
+        except ValueError:
+            continue
+    return None
+
+
 def _decode_value(meta, value):
     if meta.cls is not None and isinstance(value, str):
         # a bits leaf: space-separated bit names -> bits dataclass
@@ -1693,6 +1790,18 @@ def _decode_value(meta, value):
             except ValueError:
                 continue
         return value
+    if (
+        meta.check is not None
+        and getattr(meta.check, "base", None) == "union"
+        and isinstance(value, str)
+    ):
+        # A general union: RFC 7951 encodes some member types as JSON
+        # strings (64-bit ints, decimal64, bits, binary), so try the
+        # members in YANG order, converting the string into each
+        # member's representation, and keep the first that validates.
+        candidate = _decode_union_member(meta.check.members, value)
+        if candidate is not None:
+            return candidate
     if meta.encode == "identityref" and isinstance(value, str) and meta.identity_map:
         # Normalise every accepted spelling (bare, prefixed, or RFC 7951
         # module-qualified) to the preferred one -- bare unless the bare
@@ -2070,9 +2179,20 @@ def _parse_bound(text):
         return float(text)
 
 
-# XSD Unicode category escapes (\p{...}) that Python's re module does not
-# support, mapped to conservative ASCII approximations. Under-accepting
-# non-ASCII letters/digits is the safe direction for config-text values.
+# XSD Unicode category escapes (\p{...}), which Python's re module does
+# not support. Outside a character class the Unicode-correct spellings
+# below are substituted (libyang matches the full Unicode categories, so
+# an ASCII narrowing would falsely reject values libyang accepts);
+# categories with no exact stdlib-re spelling drop the whole pattern
+# (unenforced rather than misjudged). INSIDE a character class only bare
+# class content can be spliced in, so the ASCII approximations are used
+# there -- close enough for their one real-world occurrence, RFC 6991's
+# zone-id suffix classes, where zone ids are ASCII interface names.
+_XSD_CATEGORY_UNICODE = {
+    "L": r"[^\W\d_]",  # exactly the Unicode letters under re.UNICODE
+    "Nd": r"\d",  # \d is exactly Nd under re.UNICODE
+}
+
 _XSD_CATEGORY_ASCII = {
     "L": "A-Za-z",
     "Lu": "A-Z",
@@ -2091,12 +2211,13 @@ def _python_pattern(arg):
 
     XSD and Python regexes mostly coincide; the one construct common in
     real-world models (RFC 6991's zone-id suffixes) is the Unicode
-    category escape \\p{...}, which re lacks. Those are rewritten to
-    ASCII approximations, tracking whether the escape sits inside a
-    character class (bare class content) or outside (wrapped in []).
-    Patterns using anything else re can't compile -- including negated
-    \\P{...} categories, which have no safe ASCII approximation -- are
-    dropped."""
+    category escape \\p{...}, which re lacks. Outside a character class
+    it is rewritten to the Unicode-correct re spelling where one exists
+    (see _XSD_CATEGORY_UNICODE) and the pattern is dropped otherwise;
+    inside a character class only ASCII approximations can be spliced
+    in (see _XSD_CATEGORY_ASCII). Patterns using anything else re can't
+    compile -- including negated \\P{...} categories -- are dropped
+    (unenforced rather than misjudged)."""
     try:
         re.compile(arg)
         return arg
@@ -2112,10 +2233,16 @@ def _python_pattern(arg):
             nxt = arg[pos + 1]
             if nxt == "p":
                 match = _XSD_CATEGORY_RE.match(arg, pos)
-                ascii_class = match and _XSD_CATEGORY_ASCII.get(match.group(1))
-                if not ascii_class:
+                if not match:
                     return None
-                out.append(ascii_class if in_class else "[%s]" % ascii_class)
+                category = match.group(1)
+                if in_class:
+                    replacement = _XSD_CATEGORY_ASCII.get(category)
+                else:
+                    replacement = _XSD_CATEGORY_UNICODE.get(category)
+                if not replacement:
+                    return None
+                out.append(replacement)
                 pos = match.end()
                 continue
             if nxt == "P":
@@ -2457,6 +2584,31 @@ class _Emitter:
             return None
         return path
 
+    def _leafref_pred_must(self, node):
+        """Synthesized must expression enforcing a PREDICATED leafref:
+        the plain schema-path membership check (meta.leafref) ignores
+        path predicates, so `path "../x[k=current()/../y]/name"` would
+        accept any target value. The predicated node-set evaluated by
+        the XPath engine must contain the leaf's value instead. None
+        for predicate-free / unresolved / require-instance-false
+        leafrefs and for paths outside the evaluated XPath subset
+        (those keep only the superset schema-path check -- never
+        misjudged)."""
+        if getattr(node, "i_leafref_ptr", None) is None:
+            return None
+        path_stmt = None
+        for level in self._typedef_chain(node.search_one("type")):
+            require = level.search_one("require-instance")
+            if require is not None and require.arg == "false":
+                return None
+            path_stmt = level.search_one("path") or path_stmt
+        if path_stmt is None or "[" not in path_stmt.arg:
+            return None
+        source = self._xpath_source(path_stmt)
+        if source is None:
+            return None
+        return "(%s) = current()" % source
+
     # ---- must / when constraints ----------------------------------------
 
     def _xpath_source(self, stmt):
@@ -2670,6 +2822,15 @@ class _Emitter:
             args.append("case=%r" % (case,))
         if self.with_must_when:
             musts, whens = self._constraint_exprs(child, when_stmts)
+            if kind in ("leaf", "leaf-list"):
+                pred_must = self._leafref_pred_must(child)
+                if pred_must is not None:
+                    musts = musts + (
+                        (
+                            pred_must,
+                            "leafref has no target instance with this value",
+                        ),
+                    )
             if musts:
                 args.append("musts=%r" % (musts,))
             if whens:

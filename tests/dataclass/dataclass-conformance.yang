@@ -36,4 +36,53 @@ module dataclass-conformance {
     presence "explicitly enabled";
     leaf setting { type string; }
   }
+
+  leaf letters {
+    type string {
+      pattern '\p{L}+';
+    }
+  }
+
+  leaf target {
+    type instance-identifier {
+      require-instance false;
+    }
+  }
+
+  list srv {
+    key "name role";
+    leaf name { type string; }
+    leaf role { type string; }
+  }
+  list use {
+    key "id";
+    leaf id { type string; }
+    leaf want-role { type string; }
+    leaf pick {
+      type leafref {
+        path "../../srv[role=current()/../want-role]/name";
+      }
+    }
+  }
+
+  leaf u {
+    type union {
+      type decimal64 {
+        fraction-digits 1;
+        range "0.0..5.0";
+      }
+      type enumeration {
+        enum off;
+      }
+    }
+  }
+  leaf ub {
+    type union {
+      type bits {
+        bit x;
+        bit y;
+      }
+      type uint8;
+    }
+  }
 }
