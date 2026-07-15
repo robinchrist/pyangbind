@@ -90,4 +90,23 @@ CASES = [
             ("nested-when-true-empty", {"dt-wgm:mode": "deep", "dt-wgm:other": "x"}),
         ],
     ),
+    dict(
+        name="unicode-categories",
+        yang=M("dt-ucat", """
+  leaf not-letters { type string { pattern '[\\P{L}]+'; } }
+  leaf upper { type string { pattern '\\p{Lu}+'; } }
+  leaf spaces { type string { pattern '\\p{Zs}' ; } }
+  leaf zone { type string { pattern '(%[\\p{N}\\p{L}]+)?'; } }
+"""),
+        docs=[
+            ("notletters-ok", {"dt-ucat:not-letters": "123 .-"}),
+            ("notletters-violation", {"dt-ucat:not-letters": "ab"}),
+            ("upper-unicode-ok", {"dt-ucat:upper": "AÄÖ"}),
+            ("upper-lower-bad", {"dt-ucat:upper": "Aa"}),
+            ("space-ok", {"dt-ucat:spaces": " "}),
+            ("space-bad", {"dt-ucat:spaces": "x"}),
+            ("zone-non-ascii-ok", {"dt-ucat:zone": "%λ1"}),
+            ("zone-bad", {"dt-ucat:zone": "%!"}),
+        ],
+    ),
 ]

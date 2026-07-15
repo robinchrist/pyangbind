@@ -33,8 +33,8 @@ module dataclass-xsd-pattern {
       type host-address;
     }
     leaf negated {
-      // \P{...} has no safe ASCII approximation: this pattern must be
-      // dropped (unenforced), never misjudged or crash generation.
+      // a class whose sole member is \P{...} is the complement class:
+      // translated to [^L-content] and enforced exactly.
       type string {
         pattern '[\P{L}]+';
       }

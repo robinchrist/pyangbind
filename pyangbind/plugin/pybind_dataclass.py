@@ -938,19 +938,87 @@ def _xpath_compare(op, left, right):
     return _xpath_compare_atoms(op, left, right)
 
 
+_XSD_RT_CATEGORY_RE = re.compile(r"\\[pP]\{([A-Za-z]{1,2})\}")
+_XSD_RT_CATEGORY_CACHE = {}
+
+
+def _xsd_rt_category_class(category):
+    """Bare character-class content for one Unicode general category
+    (runtime mirror of the codegen-side expansion, for re-match());
+    None for anything unexpandable."""
+    if category in _XSD_RT_CATEGORY_CACHE:
+        return _XSD_RT_CATEGORY_CACHE[category]
+    content = None
+    if (
+        1 <= len(category) <= 2
+        and category[0] in "LMNPSZC"
+        and (len(category) == 1 or category[1].islower())
+    ):
+        import sys
+        import unicodedata
+
+        ranges = []
+        start = prev = None
+        for cp in range(sys.maxunicode + 1):
+            if 0xD800 <= cp <= 0xDFFF:
+                matched = False
+            else:
+                cat = unicodedata.category(chr(cp))
+                matched = (
+                    cat.startswith(category)
+                    if len(category) == 1
+                    else cat == category
+                )
+            if matched:
+                if start is None:
+                    start = cp
+                prev = cp
+            elif start is not None:
+                ranges.append((start, prev))
+                start = None
+        if start is not None:
+            ranges.append((start, prev))
+        if ranges:
+            parts = []
+            for low, high in ranges:
+                if low == high:
+                    parts.append(re.escape(chr(low)))
+                else:
+                    parts.append(
+                        "%s-%s" % (re.escape(chr(low)), re.escape(chr(high)))
+                    )
+            content = "".join(parts)
+    _XSD_RT_CATEGORY_CACHE[category] = content
+    return content
+
+
 def _xsd_fullmatch(text, pattern):
     """YANG 1.1 re-match(): anchored match against an XSD regex. A
     runtime miniature of the codegen-side pattern translation: XSD has
     no anchor metacharacters, so unescaped ^/$ outside a character
-    class are literal; backslash-p/-P categories and anything re cannot
-    compile raise _XPathUnsupported (skipped, not misjudged)."""
+    class are literal; backslash-p/-P categories expand to explicit
+    codepoint classes; anything re cannot compile raises
+    _XPathUnsupported (skipped, not misjudged)."""
     out, pos, in_class = [], 0, False
     length = len(pattern)
     while pos < length:
         char = pattern[pos]
         if char == "\\" and pos + 1 < length:
             if pattern[pos + 1] in "pP":
-                raise _XPathUnsupported("re-match() with \\p/\\P categories")
+                match = _XSD_RT_CATEGORY_RE.match(pattern, pos)
+                content = match and _xsd_rt_category_class(match.group(1))
+                if not content or (in_class and pattern[pos + 1] == "P"):
+                    raise _XPathUnsupported(
+                        "re-match() category %r" % pattern[pos:pos + 6]
+                    )
+                if pattern[pos + 1] == "P":
+                    out.append("[^%s]" % content)
+                elif in_class:
+                    out.append(content)
+                else:
+                    out.append("[%s]" % content)
+                pos = match.end()
+                continue
             out.append(pattern[pos:pos + 2])
             pos += 2
             continue
@@ -2403,29 +2471,58 @@ def _parse_bound(text):
         return float(text)
 
 
-# XSD Unicode category escapes (\p{...}), which Python's re module does
-# not support. Outside a character class the Unicode-correct spellings
-# below are substituted (libyang matches the full Unicode categories, so
-# an ASCII narrowing would falsely reject values libyang accepts);
-# categories with no exact stdlib-re spelling drop the whole pattern
-# (unenforced rather than misjudged). INSIDE a character class only bare
-# class content can be spliced in, so the ASCII approximations are used
-# there -- close enough for their one real-world occurrence, RFC 6991's
-# zone-id suffix classes, where zone ids are ASCII interface names.
-_XSD_CATEGORY_UNICODE = {
-    "L": r"[^\W\d_]",  # exactly the Unicode letters under re.UNICODE
-    "Nd": r"\d",  # \d is exactly Nd under re.UNICODE
-}
+# XSD Unicode category escapes (\p{...} / \P{...}), which Python's re
+# module does not support, are expanded into explicit codepoint-range
+# character classes computed from unicodedata -- exact for every general
+# category, matching libyang. Computed once per category per process.
+_XSD_CATEGORY_RE = re.compile(r"\\[pP]\{([A-Za-z]{1,2})\}")
 
-_XSD_CATEGORY_ASCII = {
-    "L": "A-Za-z",
-    "Lu": "A-Z",
-    "Ll": "a-z",
-    "N": "0-9",
-    "Nd": "0-9",
-}
+_XSD_CATEGORY_CLASS_CACHE = {}
 
-_XSD_CATEGORY_RE = re.compile(r"\\p\{([A-Za-z]{1,2})\}")
+
+def _xsd_category_class(category):
+    """Bare character-class content (range text ready to splice inside
+    [...]) matching one Unicode general category, one- or two-letter,
+    or None for anything else (e.g. XSD Is-block names). Surrogates are
+    excluded (XSD regexes operate on characters, not UTF-16 units)."""
+    if category in _XSD_CATEGORY_CLASS_CACHE:
+        return _XSD_CATEGORY_CLASS_CACHE[category]
+    if not (1 <= len(category) <= 2) or category[0] not in "LMNPSZC":
+        return None
+    if len(category) == 2 and not category[1].islower():
+        return None
+    import sys
+    import unicodedata
+
+    ranges = []
+    start = prev = None
+    for cp in range(sys.maxunicode + 1):
+        if 0xD800 <= cp <= 0xDFFF:
+            matched = False
+        else:
+            cat = unicodedata.category(chr(cp))
+            matched = cat.startswith(category) if len(category) == 1 else cat == category
+        if matched:
+            if start is None:
+                start = cp
+            prev = cp
+        elif start is not None:
+            ranges.append((start, prev))
+            start = None
+    if start is not None:
+        ranges.append((start, prev))
+    if not ranges:
+        _XSD_CATEGORY_CLASS_CACHE[category] = None
+        return None
+    parts = []
+    for low, high in ranges:
+        if low == high:
+            parts.append(re.escape(chr(low)))
+        else:
+            parts.append("%s-%s" % (re.escape(chr(low)), re.escape(chr(high))))
+    content = "".join(parts)
+    _XSD_CATEGORY_CLASS_CACHE[category] = content
+    return content
 
 
 def _python_pattern(arg):
@@ -2438,14 +2535,14 @@ def _python_pattern(arg):
     there while Python's re anchors on them -- every pattern therefore
     goes through this translation (unescaped ^/$ outside a character
     class are escaped; the negating ^ right after [ is kept). The other
-    real-world construct is the Unicode category escape \\p{...}, which
-    re lacks: outside a character class it is rewritten to the
-    Unicode-correct re spelling where one exists (see
-    _XSD_CATEGORY_UNICODE) and the pattern is dropped otherwise; inside
-    a character class only ASCII approximations can be spliced in (see
-    _XSD_CATEGORY_ASCII). Patterns using anything else re can't compile
-    -- including negated \\P{...} categories -- are dropped (unenforced
-    rather than misjudged)."""
+    real-world construct is the Unicode category escape \\p{...} /
+    \\P{...}, which re lacks: it is expanded into an explicit
+    codepoint-range class (exact, from unicodedata) -- \\p inline or in
+    a class, \\P as a negated class outside one (\\P inside a class has
+    no splice-able complement, so that pattern is dropped). Patterns
+    using anything else re can't compile -- e.g. XSD Is-block names or
+    class subtraction -- are dropped (unenforced rather than
+    misjudged)."""
     out = []
     pos = 0
     in_class = False
@@ -2454,22 +2551,21 @@ def _python_pattern(arg):
         char = arg[pos]
         if char == "\\" and pos + 1 < length:
             nxt = arg[pos + 1]
-            if nxt == "p":
+            if nxt in "pP":
                 match = _XSD_CATEGORY_RE.match(arg, pos)
-                if not match:
+                content = match and _xsd_category_class(match.group(1))
+                if not content:
                     return None
-                category = match.group(1)
-                if in_class:
-                    replacement = _XSD_CATEGORY_ASCII.get(category)
+                if nxt == "P":
+                    if in_class:
+                        return None  # no complement inside a class
+                    out.append("[^%s]" % content)
+                elif in_class:
+                    out.append(content)
                 else:
-                    replacement = _XSD_CATEGORY_UNICODE.get(category)
-                if not replacement:
-                    return None
-                out.append(replacement)
+                    out.append("[%s]" % content)
                 pos = match.end()
                 continue
-            if nxt == "P":
-                return None
             out.append(arg[pos : pos + 2])
             pos += 2
             continue
@@ -2479,6 +2575,18 @@ def _python_pattern(arg):
             pos += 1
             continue
         if char == "[":
+            # a class whose SOLE member is \P{...} is expressible as a
+            # negated (or, under [^...], a plain) category class
+            sole = re.match(r"\[(\^?)\\P\{([A-Za-z]{1,2})\}\]", arg[pos:])
+            if sole is not None:
+                content = _xsd_category_class(sole.group(2))
+                if not content:
+                    return None
+                out.append(
+                    "[%s]" % content if sole.group(1) else "[^%s]" % content
+                )
+                pos += sole.end()
+                continue
             in_class = True
             out.append(char)
             pos += 1

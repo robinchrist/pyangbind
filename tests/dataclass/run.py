@@ -667,11 +667,11 @@ class DataclassNoValidationTests(unittest.TestCase):
 
 
 class DataclassXsdPatternTests(unittest.TestCase):
-    """XSD-flavored regexes (dataclass-xsd-pattern.yang): \\p{...}
-    Unicode category escapes are translated to ASCII approximations
-    instead of silently dropping the pattern -- dropping the BASE
-    pattern of an RFC 6991-style typedef chain (ipv4-address-no-zone)
-    used to leave only the weak derived restriction in force."""
+    """XSD-flavored regexes (dataclass-xsd-pattern.yang): \\p{...} /
+    \\P{...} Unicode category escapes expand to exact codepoint-range
+    classes computed from unicodedata -- dropping the BASE pattern of
+    an RFC 6991-style typedef chain (ipv4-address-no-zone) used to
+    leave only the weak derived restriction in force."""
 
     @classmethod
     def setUpClass(cls):
@@ -693,36 +693,52 @@ class DataclassXsdPatternTests(unittest.TestCase):
 
     def test_translated_category_escape_matches(self):
         box = self.bindings.DataclassXsdPattern.Box()
-        box.zoned_addr = "192.0.2.1%eth0"  # \\p{N}\\p{L} -> [0-9A-Za-z]
+        box.zoned_addr = "192.0.2.1%eth0"
+        box.zoned_addr = "192.0.2.1%λ1"  # exact categories: non-ASCII ok
         with self.assertRaises(self.bindings.YangValidationError):
             box.zoned_addr = "192.0.2.1%"  # zone must be non-empty
+        with self.assertRaises(self.bindings.YangValidationError):
+            box.zoned_addr = "192.0.2.1%!"  # not a letter or number
 
-    def test_negated_category_pattern_dropped_not_misjudged(self):
-        # \\P{...} is untranslatable: the pattern is unenforced, so any
-        # string is accepted (and generation did not crash).
+    def test_negated_category_class(self):
+        # [\P{L}] is a class whose sole member is a complement:
+        # expressible as [^L-content] and enforced
         box = self.bindings.DataclassXsdPattern.Box()
-        box.negated = "letters would violate the original pattern"
+        box.negated = "123 .-"
+        with self.assertRaises(self.bindings.YangValidationError):
+            box.negated = "letters violate the original pattern"
 
     def test_python_pattern_translation_unit(self):
+        import re as _re
+
         sys.path.insert(0, BASE_DIR)
         try:
             from pyangbind.plugin.pybind_dataclass import _python_pattern
         finally:
             sys.path.pop(0)
         self.assertEqual(_python_pattern("[a-z]+"), "[a-z]+")  # untouched
-        # inside a character class: ASCII approximations (zone-ids)
-        self.assertEqual(
-            _python_pattern(r"(%[\p{N}\p{L}]+)?"), "(%[0-9A-Za-z]+)?"
-        )
-        # outside a class: Unicode-correct spellings where they exist
-        # (libyang matches the full categories) ...
-        self.assertEqual(_python_pattern(r"\p{L}+"), r"[^\W\d_]+")
-        self.assertEqual(_python_pattern(r"\p{Nd}*"), r"\d*")
-        # ... and inexpressible categories drop the pattern instead of
-        # narrowing it to ASCII (unenforced rather than misjudged)
-        self.assertIsNone(_python_pattern(r"\p{Lu}\p{Nd}*"))
-        self.assertIsNone(_python_pattern(r"[\P{L}]+"))  # no safe negation
-        self.assertIsNone(_python_pattern(r"\p{Zs}"))  # unmapped category
+
+        def full(pattern, value):
+            return _re.fullmatch(_python_pattern(pattern), value) is not None
+
+        # exact category expansion, inside and outside classes
+        self.assertTrue(full(r"(%[\p{N}\p{L}]+)?", "%eth0"))
+        self.assertTrue(full(r"(%[\p{N}\p{L}]+)?", "%λ1"))
+        self.assertFalse(full(r"(%[\p{N}\p{L}]+)?", "%!"))
+        self.assertTrue(full(r"\p{L}+", "äö"))
+        self.assertFalse(full(r"\p{L}+", "a1"))
+        self.assertTrue(full(r"\p{Lu}\p{Nd}*", "Ä42"))
+        self.assertFalse(full(r"\p{Lu}\p{Nd}*", "a42"))
+        self.assertTrue(full(r"\p{Zs}", " "))
+        self.assertTrue(full(r"\P{L}+", "12 .-"))
+        self.assertFalse(full(r"\P{L}+", "ab"))
+        self.assertTrue(full(r"[\P{L}]+", "12 .-"))
+        self.assertFalse(full(r"[\P{L}]+", "ab"))
+        self.assertTrue(full(r"[^\P{L}]+", "äb"))
+        # \P mixed INTO a class has no splice-able complement: dropped
+        self.assertIsNone(_python_pattern(r"[x\P{L}]+"))
+        # XSD Is-block names are not general categories: dropped
+        self.assertIsNone(_python_pattern(r"\p{IsBasicLatin}+"))
 
 
 class DataclassNativeInetTests(unittest.TestCase):
