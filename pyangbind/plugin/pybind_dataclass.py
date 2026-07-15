@@ -2059,6 +2059,14 @@ def validate_tree(*roots):
         steps = _parse_instance_identifier(text)
         if steps is None:
             return  # not i-i syntax: already rejected by the value check
+        if steps[0][0] is None:
+            # RFC 7951 6.11: the leading identifier is always
+            # namespace-qualified
+            errors.append(
+                "%s: instance-identifier %r must qualify its first node "
+                "with a module name (RFC 7951 6.11)" % (fpath, text)
+            )
+            return
         if steps[0][0] not in root_modules:
             return  # outside the validated module set: cannot judge
         # schema classes and data instances tracked in parallel: schema
