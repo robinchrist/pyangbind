@@ -125,7 +125,8 @@ if __name__ == "__main__":
     import cases as batch1
     import cases2 as batch2
     import cases3 as batch3
+    import cases4 as batch4
 
-    all_cases = batch1.CASES + batch2.CASES + batch3.CASES
+    all_cases = batch1.CASES + batch2.CASES + batch3.CASES + batch4.CASES
     only = next((a for a in sys.argv[1:] if a != "-v"), None)
     sys.exit(main(all_cases, only=only, verbose="-v" in sys.argv))

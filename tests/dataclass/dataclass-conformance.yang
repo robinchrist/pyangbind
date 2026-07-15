@@ -43,6 +43,18 @@ module dataclass-conformance {
     }
   }
 
+  leaf anchored {
+    type string {
+      // XSD regexes have no anchors: ^ and $ are literal characters
+      pattern "a$b";
+    }
+  }
+
+  leaf blob {
+    type binary;
+    default "eWFuZw==";
+  }
+
   leaf target {
     type instance-identifier {
       require-instance false;

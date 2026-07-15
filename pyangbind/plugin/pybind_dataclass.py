@@ -211,6 +211,8 @@ The pre-validation/pre-defaults variant of this backend is preserved
 verbatim as ``pybind-dataclass-dumb``.
 """
 
+import base64
+import binascii
 import importlib
 import keyword
 import optparse
@@ -345,6 +347,7 @@ _XPATH_SUPPORTED_FUNCTIONS = frozenset(
         "false",
         "not",
         "number",
+        "re-match",
         "starts-with",
         "string",
         "string-length",
@@ -928,6 +931,45 @@ def _xpath_compare(op, left, right):
     return _xpath_compare_atoms(op, left, right)
 
 
+def _xsd_fullmatch(text, pattern):
+    """YANG 1.1 re-match(): anchored match against an XSD regex. A
+    runtime miniature of the codegen-side pattern translation: XSD has
+    no anchor metacharacters, so unescaped ^/$ outside a character
+    class are literal; backslash-p/-P categories and anything re cannot
+    compile raise _XPathUnsupported (skipped, not misjudged)."""
+    out, pos, in_class = [], 0, False
+    length = len(pattern)
+    while pos < length:
+        char = pattern[pos]
+        if char == "\\" and pos + 1 < length:
+            if pattern[pos + 1] in "pP":
+                raise _XPathUnsupported("re-match() with \\p/\\P categories")
+            out.append(pattern[pos:pos + 2])
+            pos += 2
+            continue
+        if not in_class and (char == "^" or char == "$"):
+            out.append("\\" + char)
+            pos += 1
+            continue
+        if char == "[":
+            in_class = True
+            out.append(char)
+            pos += 1
+            if pos < length and pattern[pos] == "^":
+                out.append("^")
+                pos += 1
+            continue
+        if char == "]":
+            in_class = False
+        out.append(char)
+        pos += 1
+    try:
+        compiled = re.compile("".join(out))
+    except re.error:
+        raise _XPathUnsupported("re-match() pattern %r" % pattern)
+    return compiled.fullmatch(text) is not None
+
+
 def _xpath_call(name, args, ctx, env):
     if name == "current":
         return [env["current"]]
@@ -954,6 +996,8 @@ def _xpath_call(name, args, ctx, env):
         return _xpath_string(values[1]) in _xpath_string(values[0])
     if name == "starts-with":
         return _xpath_string(values[0]).startswith(_xpath_string(values[1]))
+    if name == "re-match":
+        return _xsd_fullmatch(_xpath_string(values[0]), _xpath_string(values[1]))
     if name == "string-length":
         return float(len(_xpath_string(values[0]) if values else _xnode_string(ctx)))
     if name in ("derived-from", "derived-from-or-self"):
@@ -1113,6 +1157,9 @@ class _Check:
     patterns: tuple = ()  # every pattern must fullmatch (YANG ANDs them)
     inverted_patterns: tuple = ()  # `modifier invert-match`: must NOT fullmatch
     values: tuple = ()  # allowed enum/identityref strings; () = unrestricted
+    # identityrefs are CLOSED sets: an empty derived set in the compiled
+    # modules means no value is valid (not "unrestricted")
+    closed: bool = False
     bits: tuple = ()  # allowed bit names; () = unrestricted
     members: tuple = ()  # union member checks; at least one must pass
     fraction_digits: int = 0  # decimal64 precision; 0 = not a decimal64
@@ -1135,6 +1182,11 @@ class _Check:
         if self.values and value not in self.values:
             raise YangValidationError(
                 "%s: %r is not one of the allowed values %s" % (path, value, list(self.values))
+            )
+        if self.closed and not self.values:
+            raise YangValidationError(
+                "%s: %r cannot be valid -- no identity derived from the "
+                "base is in the compiled module set" % (path, value)
             )
         for statement in self.ranges:
             if not any(
@@ -1677,6 +1729,21 @@ def to_ietf_json(root):
     return encode_node(root, None)
 
 
+def _union_flat(check):
+    """Union member checks with nested unions flattened."""
+    for member in check.members:
+        if getattr(member, "base", None) == "union":
+            yield from _union_flat(member)
+        else:
+            yield member
+
+
+def _int64_member(member):
+    """Whether an int member check is 64-bit (string-encoded, RFC 7951)."""
+    bounds = [b for stmt in member.ranges for pair in stmt for b in pair]
+    return any(b is not None and abs(b) > 2**32 for b in bounds)
+
+
 def _decode_union_member(members, value):
     """First union member (in YANG order) that accepts `value` decoded
     into that member's representation, or None when no member does
@@ -1708,8 +1775,7 @@ def _decode_union_member(members, value):
             # only 64-bit integers are string-encoded (RFC 7951 6.1);
             # narrower ints encode as JSON numbers, so a string must
             # not match them
-            bounds = [b for stmt in member.ranges for pair in stmt for b in pair]
-            if not any(b is not None and abs(b) > 2**32 for b in bounds):
+            if not _int64_member(member):
                 continue
             try:
                 candidate = int(value)
@@ -1745,7 +1811,13 @@ def _decode_value(meta, value):
             )
         return int(value)
     if meta.encode == "decimal":
-        return decimal.Decimal(str(value))
+        # RFC 7951 6.1: decimal64 is encoded as a JSON string
+        if not isinstance(value, str):
+            raise ValueError(
+                "%r: a decimal64 value must be a JSON string (RFC 7951)"
+                % (value,)
+            )
+        return decimal.Decimal(value)
     if meta.encode == "empty":
         # RFC 7951 6.9: type empty is encoded as [null]
         if value != [None]:
@@ -1790,27 +1862,72 @@ def _decode_value(meta, value):
             except ValueError:
                 continue
         return value
-    if (
-        meta.check is not None
-        and getattr(meta.check, "base", None) == "union"
-        and isinstance(value, str)
-    ):
-        # A general union: RFC 7951 encodes some member types as JSON
-        # strings (64-bit ints, decimal64, bits, binary), so try the
-        # members in YANG order, converting the string into each
-        # member's representation, and keep the first that validates.
-        candidate = _decode_union_member(meta.check.members, value)
-        if candidate is not None:
-            return candidate
+    if meta.check is not None and getattr(meta.check, "base", None) == "union":
+        if isinstance(value, str):
+            # A general union: RFC 7951 encodes some member types as JSON
+            # strings (64-bit ints, decimal64, bits, binary), so try the
+            # members in YANG order, converting the string into each
+            # member's representation, and keep the first that validates.
+            candidate = _decode_union_member(meta.check.members, value)
+            if candidate is not None:
+                return candidate
+        elif isinstance(value, bool):
+            if not any(m.base == "bool" for m in _union_flat(meta.check)):
+                raise ValueError(
+                    "%r: no boolean member in the union (RFC 7951)" % (value,)
+                )
+        elif isinstance(value, int):
+            # a JSON number matches only int members narrower than 64
+            # bits (RFC 7951 6.1: 64-bit ints are strings)
+            ok = False
+            for m in _union_flat(meta.check):
+                if m.base != "int" or _int64_member(m):
+                    continue
+                try:
+                    m.validate(value, "")
+                    ok = True
+                    break
+                except ValueError:
+                    continue
+            if not ok:
+                raise ValueError(
+                    "%r: no union member takes this JSON number "
+                    "(RFC 7951: 64-bit ints and decimal64 are strings)"
+                    % (value,)
+                )
+        elif isinstance(value, float):
+            raise ValueError(
+                "%r: no YANG type is encoded as a JSON fraction "
+                "(decimal64 is a string, RFC 7951 6.1)" % (value,)
+            )
     if meta.encode == "identityref" and isinstance(value, str) and meta.identity_map:
-        # Normalise every accepted spelling (bare, prefixed, or RFC 7951
-        # module-qualified) to the preferred one -- bare unless the bare
-        # name is claimed by a different identity -- so a decoded tree
-        # compares equal to one built with defaults/bare assignments.
-        canonical = meta.identity_map.get(value, value)
-        accepted = [k for k, v in meta.identity_map.items() if v == canonical]
-        if accepted:
-            return min(accepted, key=lambda s: (":" in s, s))
+        # RFC 7951 6.8: the qualifier of an identityref value is the
+        # DEFINING MODULE's name, and may be omitted only when that is
+        # the leaf's own module. YANG-prefix spellings and cross-module
+        # bare names are assignment-time conveniences, not valid JSON.
+        canonical = meta.identity_map.get(value)
+        if canonical is not None:
+            if ":" in value:
+                if value != canonical:
+                    raise ValueError(
+                        "%r: an identityref is module-qualified as %r in "
+                        "RFC 7951 JSON (YANG-prefix spellings are not "
+                        "valid)" % (value, canonical)
+                    )
+            elif canonical.split(":", 1)[0] != meta.module:
+                raise ValueError(
+                    "%r: identity defined outside the leaf's module must "
+                    "be module-qualified as %r (RFC 7951 6.8)"
+                    % (value, canonical)
+                )
+        # Normalise the accepted spelling to the preferred one -- bare
+        # unless the bare name is claimed by a different identity -- so a
+        # decoded tree compares equal to one built with defaults/bare
+        # assignments.
+        if canonical is not None:
+            accepted = [k for k, v in meta.identity_map.items() if v == canonical]
+            if accepted:
+                return min(accepted, key=lambda s: (":" in s, s))
     return value
 
 
@@ -2144,6 +2261,9 @@ def _build_identity_values(ctx):
                 direct_derived.setdefault(id(target), []).append(ident)
 
     def spellings(ident):
+        # the RFC 7951 canonical module-qualified form, the YANG-prefix
+        # form (assignment-time convenience) and the bare name
+        yield "%s:%s" % (_Emitter._module_name(ident), ident.arg)
         prefix_stmt = ident.i_module.search_one("prefix")
         if prefix_stmt is not None:
             yield "%s:%s" % (prefix_stmt.arg, ident.arg)
@@ -2209,20 +2329,19 @@ def _python_pattern(arg):
     compile, or None if it can't be salvaged (that pattern is then not
     enforced rather than misjudged).
 
-    XSD and Python regexes mostly coincide; the one construct common in
-    real-world models (RFC 6991's zone-id suffixes) is the Unicode
-    category escape \\p{...}, which re lacks. Outside a character class
-    it is rewritten to the Unicode-correct re spelling where one exists
-    (see _XSD_CATEGORY_UNICODE) and the pattern is dropped otherwise;
-    inside a character class only ASCII approximations can be spliced
-    in (see _XSD_CATEGORY_ASCII). Patterns using anything else re can't
-    compile -- including negated \\P{...} categories -- are dropped
-    (unenforced rather than misjudged)."""
-    try:
-        re.compile(arg)
-        return arg
-    except re.error:
-        pass
+    XSD and Python regexes mostly coincide, but never exactly: XSD has
+    no anchor metacharacters, so `^` and `$` are ordinary characters
+    there while Python's re anchors on them -- every pattern therefore
+    goes through this translation (unescaped ^/$ outside a character
+    class are escaped; the negating ^ right after [ is kept). The other
+    real-world construct is the Unicode category escape \\p{...}, which
+    re lacks: outside a character class it is rewritten to the
+    Unicode-correct re spelling where one exists (see
+    _XSD_CATEGORY_UNICODE) and the pattern is dropped otherwise; inside
+    a character class only ASCII approximations can be spliced in (see
+    _XSD_CATEGORY_ASCII). Patterns using anything else re can't compile
+    -- including negated \\P{...} categories -- are dropped (unenforced
+    rather than misjudged)."""
     out = []
     pos = 0
     in_class = False
@@ -2250,9 +2369,21 @@ def _python_pattern(arg):
             out.append(arg[pos : pos + 2])
             pos += 2
             continue
+        if not in_class and char in "^$":
+            # XSD regexes have no anchors: ^ and $ are literal there
+            out.append("\\" + char)
+            pos += 1
+            continue
         if char == "[":
             in_class = True
-        elif char == "]":
+            out.append(char)
+            pos += 1
+            # the ^ right after [ is class negation in XSD and re alike
+            if pos < length and arg[pos] == "^":
+                out.append("^")
+                pos += 1
+            continue
+        if char == "]":
             in_class = False
         out.append(char)
         pos += 1
@@ -2927,6 +3058,7 @@ class _Emitter:
 
         values = ()
         bits = ()
+        closed = False
         members = []
         if base.arg == "union":
             for member in base.search("type"):
@@ -2944,11 +3076,12 @@ class _Emitter:
             values = tuple(enum_names)
             check_base = "str"
         elif base.arg == "identityref":
+            # closed set: an empty derived set means NO value is valid
+            # (libyang agrees), not "unrestricted"
             identity_names = self._identityref_values(base)
-            if not identity_names:
-                return None
             values = tuple(identity_names)
             check_base = "str"
+            closed = True
         elif base.arg == "leafref":
             target = self._leafref_target(node, depth)
             if target is None:
@@ -2976,6 +3109,8 @@ class _Emitter:
             args.append("inverted_patterns=%r" % (tuple(inverted),))
         if values:
             args.append("values=%r" % (values,))
+        if closed:
+            args.append("closed=True")
         if bits:
             args.append("bits=%r" % (bits,))
         if members:
@@ -3049,6 +3184,12 @@ class _Emitter:
         if base.arg == "decimal64":
             self.uses_decimal = True
             return "decimal.Decimal(%r)" % text.strip()
+        if base.arg == "binary":
+            # the YANG default is the base64 text; the field holds bytes
+            try:
+                return repr(base64.b64decode(text.strip(), validate=True))
+            except (ValueError, binascii.Error):
+                return repr(text)  # malformed schema default: leave as-is
         if base.arg == "union":
             try:
                 return repr(int(text, 0))

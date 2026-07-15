@@ -56,9 +56,14 @@ module dataclass-constraints {
       }
       leaf odd {
         type string;
-        // re-match() is outside the evaluated subset: filtered out at
-        // codegen, so this must can never fail (or pass) validation.
+        // anchored, XSD-flavored (YANG 1.1 10.2.1)
         must "re-match(., 'a+')";
+      }
+      leaf linked {
+        type string;
+        // deref() is outside the evaluated subset: filtered out at
+        // codegen, so this must can never fail (or pass) validation.
+        must "deref(.)";
       }
     }
     container members {

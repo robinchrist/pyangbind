@@ -146,8 +146,12 @@ class DataclassReusableAliasTests(unittest.TestCase):
     def test_identityref_aliased_by_base_identity(self):
         self.assertTrue(hasattr(self.bindings, "Animal"))
         values = set(typing.get_args(self.bindings.Animal.__value__))
-        # both bare and module-prefixed spellings of every derived identity
-        self.assertEqual(values, {"dog", "cat", "dc:dog", "dc:cat"})
+        # bare, YANG-prefix and RFC 7951 module-qualified spellings of
+        # every derived identity
+        self.assertEqual(
+            values,
+            {"dog", "cat", "dc:dog", "dc:cat", "dataclass:dog", "dataclass:cat"},
+        )
         self.assertEqual(self.bindings.Dataclass.Box.__annotations__["pet"], "Animal | None")
 
     def test_inline_anonymous_enum_not_hoisted(self):
@@ -521,15 +525,19 @@ class DataclassSerdeTests(unittest.TestCase):
         self.assertEqual(decoded, self.tree)
 
     def test_decode_normalises_identityref_spelling(self):
-        # every accepted spelling decodes to the bare one -- including a
-        # spelling that is itself a valid map key (the prefixed form),
-        # which used to be returned untouched and broke round-trip
-        # equality whenever a module's prefix equals its name
-        for spelling in ("dog", "dc:dog", "dataclass:dog"):
+        # the RFC 7951 spellings (module-qualified, or bare for the
+        # leaf's own module) decode to the bare one; the YANG-prefix
+        # spelling stays an assignment-time convenience only and is
+        # REJECTED in JSON (libyang agrees)
+        for spelling in ("dog", "dataclass:dog"):
             decoded = self.bindings.from_ietf_json(
                 self.bindings.Dataclass, {"box": {"pet": spelling}}
             )
             self.assertEqual(decoded.box.pet, "dog", spelling)
+        with self.assertRaisesRegex(ValueError, "RFC 7951"):
+            self.bindings.from_ietf_json(
+                self.bindings.Dataclass, {"box": {"pet": "dc:dog"}}
+            )
 
     def test_decode_accepts_bare_names(self):
         decoded = self.bindings.from_ietf_json(
@@ -1005,12 +1013,19 @@ class DataclassMustWhenTests(unittest.TestCase):
         self.tree.wrap.mode = "a"
         self.assertIn("wrap/b-only", self._violations())
 
-    def test_unsupported_expression_is_skipped_not_misjudged(self):
-        # re-match() is not implemented; the must on `odd` is filtered
-        # out at codegen, so any value passes
-        self.tree.net.vrf = [self.Vrf(name="a", odd="zzz")]
+    def test_re_match(self):
+        # re-match() is anchored and XSD-flavored
+        self.tree.net.vrf = [self.Vrf(name="a", odd="aaa")]
         self.bindings.validate_tree(self.tree)
-        self.assertNotIn("re-match", self.bindings._source)
+        self.tree.net.vrf = [self.Vrf(name="a", odd="zzz")]
+        self.assertIn("re-match", self._violations())
+
+    def test_unsupported_expression_is_skipped_not_misjudged(self):
+        # deref() is not implemented; the must on `linked` is filtered
+        # out at codegen, so any value passes
+        self.tree.net.vrf = [self.Vrf(name="a", linked="anything")]
+        self.bindings.validate_tree(self.tree)
+        self.assertNotIn("deref", self.bindings._source)
 
     def test_opt_out_flag(self):
         bindings = generate("--no-dataclass-must-when", yang_file=self.yang)
@@ -1313,6 +1328,16 @@ class DataclassConformanceTests(unittest.TestCase):
         self.tree.letters = "äö"  # \p{L} matches all Unicode letters
         with self.assertRaises(self.bindings.YangValidationError):
             self.tree.letters = "a1"
+
+    def test_xsd_anchors_are_literal(self):
+        self.tree.anchored = "a$b"  # $ is an ordinary character in XSD
+        with self.assertRaises(self.bindings.YangValidationError):
+            self.tree.anchored = "ab"
+
+    def test_binary_default_is_bytes(self):
+        # generated with defaults here (no --no-dataclass-defaults)
+        self.assertEqual(self.tree.blob, b"yang")
+        self.bindings.validate_tree(self.tree)
 
     def test_instance_identifier_syntax(self):
         self.tree.target = "/dcc:srv[name='a'][role='x']/dcc:name"
