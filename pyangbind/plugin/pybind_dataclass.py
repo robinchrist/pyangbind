@@ -1368,6 +1368,9 @@ def validate_tree(*roots):
     leaf_values = {}  # target schema path -> values present in the trees
     leafref_uses = []  # (instance path, target schema path, value)
     constraints = []  # (is_must, context _XNode, expression, message, path)
+    # when-guarded empty non-presence containers whose pending checks
+    # apply only if their when conditions hold: resolved after the walk
+    guarded_deferred = []
     doc = _XNode(None, None, None, roots=list(roots))
 
     def queue_constraints(meta, xnode, fpath):
@@ -1417,20 +1420,34 @@ def validate_tree(*roots):
                     field_set, hoisted = walk(value, fpath, fschema, meta.module, xchild)
                     if field_set:
                         queue_constraints(meta, xchild, fpath)
-                    elif not meta.presence and not meta.whens:
+                    elif not meta.presence:
                         # Empty non-presence container: it exists
                         # implicitly wherever this node exists, so its
                         # hoisted mandatory checks and its own musts
                         # stay pending here, gated on this container's
                         # case (if any). An empty presence container is
-                        # absent and contributes nothing; a when-guarded
-                        # container is skipped, never misjudged.
-                        for _case, kind, payload in hoisted:
-                            pending.append((meta.case, kind, payload))
-                        if meta.musts:
+                        # absent and contributes nothing. A when-guarded
+                        # container's checks are deferred until after
+                        # the walk, when its when conditions can be
+                        # evaluated against the finished tree (they
+                        # apply only if every when is true; conditions
+                        # outside the XPath subset skip the checks,
+                        # never misjudging).
+                        if meta.whens:
                             pending.append(
-                                (meta.case, "must", (meta, xchild, fpath))
+                                (
+                                    meta.case,
+                                    "guarded",
+                                    (meta, xchild, fpath, hoisted),
+                                )
                             )
+                        else:
+                            for _case, kind, payload in hoisted:
+                                pending.append((meta.case, kind, payload))
+                            if meta.musts:
+                                pending.append(
+                                    (meta.case, "must", (meta, xchild, fpath))
+                                )
             elif meta.kind == "list":
                 entries = value or []
                 seen_keys = set()
@@ -1591,6 +1608,8 @@ def validate_tree(*roots):
                     continue
                 if kind == "error":
                     errors.append(payload)
+                elif kind == "guarded":
+                    guarded_deferred.append(payload)
                 else:
                     queue_constraints(*payload)
         else:
@@ -1605,6 +1624,28 @@ def validate_tree(*roots):
         # A passed root is the datastore itself: it exists, so even
         # top-level mandatory nodes (legal, if unusual, YANG) apply.
         walk(root, "", "", None, doc, force_exists=True)
+
+    def resolve_guarded(payload):
+        meta, xchild, fpath, items = payload
+        for expression, self_context in meta.whens:
+            context = xchild if self_context else xchild.parent
+            try:
+                if not _xpath_check(expression, context, doc):
+                    return
+            except _XPathUnsupported:
+                return  # outside the subset: skip, never misjudge
+        for _case, kind, inner in items:
+            if kind == "error":
+                errors.append(inner)
+            elif kind == "guarded":
+                resolve_guarded(inner)
+            else:
+                queue_constraints(*inner)
+        if meta.musts:
+            queue_constraints(meta, xchild, fpath)
+
+    for payload in guarded_deferred:
+        resolve_guarded(payload)
     for path, target, value in leafref_uses:
         if value not in leaf_values.get(target, ()):
             errors.append(

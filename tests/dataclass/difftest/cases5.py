@@ -68,4 +68,26 @@ CASES = [
             ("or-self-unrelated", {"dt-dft:kind": "other", "dt-dft:need-mid-self": "x"}),
         ],
     ),
+    dict(
+        name="when-guarded-mandatory",
+        yang=M("dt-wgm", """
+  leaf mode { type string; }
+  container g {
+    when "../mode = 'on'";
+    leaf req { type string; mandatory true; }
+  }
+  container outer {
+    when "../mode = 'deep'";
+    container inner { leaf need { type string; mandatory true; } }
+  }
+  leaf other { type string; }
+"""),
+        docs=[
+            ("when-true-empty", {"dt-wgm:mode": "on", "dt-wgm:other": "x"}),
+            ("when-false-empty", {"dt-wgm:mode": "off", "dt-wgm:other": "x"}),
+            ("when-true-satisfied", {"dt-wgm:mode": "on", "dt-wgm:g": {"req": "r"},
+                                     "dt-wgm:other": "x"}),
+            ("nested-when-true-empty", {"dt-wgm:mode": "deep", "dt-wgm:other": "x"}),
+        ],
+    ),
 ]
