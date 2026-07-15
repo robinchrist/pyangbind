@@ -376,7 +376,9 @@ class _FieldMeta:
     min_elements: int | None = None
     max_elements: int | None = None
     keys: tuple = ()  # list key field names
-    unique: tuple = ()  # list `unique` groups, tuples of field names
+    # list `unique` groups: each group is a tuple of leaf paths, each
+    # path a tuple of field-name steps (descendant containers + leaf)
+    unique: tuple = ()
     leafref: str | None = None  # absolute schema path of the leafref target
     # chain of (choice, case) pairs a choice-flattened field came out
     # of, outermost first; None for fields outside any choice
@@ -1423,13 +1425,29 @@ def validate_tree(*roots):
                                 )
                             seen_keys.add(key_tuple)
                     for group in meta.unique:
-                        values = tuple(getattr(entry, g, None) for g in group)
+                        values = []
+                        for leaf_path in group:
+                            obj = entry
+                            for step in leaf_path[:-1]:
+                                obj = getattr(obj, step, None)
+                                if obj is None:
+                                    break
+                            values.append(
+                                getattr(obj, leaf_path[-1], None)
+                                if obj is not None
+                                else None
+                            )
+                        values = tuple(values)
                         if None in values:
                             continue  # unique applies only where all leaves exist
                         if values in seen_unique[group]:
                             errors.append(
                                 "%s: violates unique %r: %r is already present"
-                                % (epath, "/".join(group), values)
+                                % (
+                                    epath,
+                                    " ".join("/".join(p) for p in group),
+                                    values,
+                                )
                             )
                         seen_unique[group].add(values)
                 if meta.max_elements is not None and len(entries) > meta.max_elements:
@@ -2715,6 +2733,38 @@ class _Emitter:
             return None
         return path
 
+    @staticmethod
+    def _unique_leaf_path(list_stmt, part):
+        """One `unique` argument resolved to a tuple of generated field
+        names (descendant containers then the leaf), or None when it
+        cannot be resolved (the group is then not checked). Choice and
+        case steps in the schema node identifier are consumed without
+        contributing a field -- the dataclasses flatten them away."""
+        node = list_stmt
+        fields = []
+        for step in part.split("/"):
+            name = step.split(":")[-1]
+            child = next(
+                (
+                    c
+                    for c in getattr(node, "i_children", []) or []
+                    if c.arg == name
+                ),
+                None,
+            )
+            if child is None:
+                return None
+            if child.keyword in ("choice", "case"):
+                node = child
+                continue
+            if child.keyword not in ("container", "leaf"):
+                return None
+            fields.append(safe_name(name))
+            node = child
+        if not fields or node.keyword != "leaf":
+            return None
+        return tuple(fields)
+
     def _leafref_pred_must(self, node):
         """Synthesized must expression enforcing an instance-scoped
         leafref: the plain schema-path membership check (meta.leafref)
@@ -2958,10 +3008,15 @@ class _Emitter:
                 args.append("keys=%r" % (tuple(safe_name(k) for k in key.arg.split()),))
             unique_groups = []
             for unique in child.search("unique"):
-                parts = unique.arg.split()
-                if any("/" in part for part in parts):
-                    continue  # descendant unique paths are not checked
-                unique_groups.append(tuple(safe_name(p.split(":")[-1]) for p in parts))
+                group = []
+                for part in unique.arg.split():
+                    leaf_path = self._unique_leaf_path(child, part)
+                    if leaf_path is None:
+                        group = None  # unresolvable: skip the whole group
+                        break
+                    group.append(leaf_path)
+                if group:
+                    unique_groups.append(tuple(group))
             if unique_groups:
                 args.append("unique=%r" % (tuple(unique_groups),))
         if case is not None:

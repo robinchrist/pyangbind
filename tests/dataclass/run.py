@@ -244,7 +244,7 @@ class DataclassMetadataTests(unittest.TestCase):
     def test_list_structural_meta(self):
         server = self.top.Refs._yang_fields["server"]
         self.assertEqual(server.keys, ("name",))
-        self.assertEqual(server.unique, (("port",),))
+        self.assertEqual(server.unique, ((("port",),),))
         self.assertEqual(server.max_elements, 4)
         self.assertTrue(self.top.Refs.Server._yang_fields["proto"].mandatory)
 
