@@ -783,9 +783,11 @@ class _XPathParser:
             return self.parse_steps_after(("expr", inner))
         if kind == "num":
             self.advance()
+            assert value is not None
             return ("num", float(value))
         if kind == "lit":
             self.advance()
+            assert value is not None
             return ("lit", value[1:-1])
         if (
             kind == "name"
@@ -994,7 +996,7 @@ def _xpath_compare(op, left, right):
 
 
 _XSD_RT_CATEGORY_RE = re.compile(r"\\[pP]\{([A-Za-z]{1,2})\}")
-_XSD_RT_CATEGORY_CACHE = {}
+_XSD_RT_CATEGORY_CACHE: dict = {}
 
 
 def _xsd_rt_category_class(category):
@@ -1061,7 +1063,11 @@ def _xsd_fullmatch(text, pattern):
         if char == "\\" and pos + 1 < length:
             if pattern[pos + 1] in "pP":
                 match = _XSD_RT_CATEGORY_RE.match(pattern, pos)
-                content = match and _xsd_rt_category_class(match.group(1))
+                if match is None:
+                    raise _XPathUnsupported(
+                        "re-match() category %r" % pattern[pos:pos + 6]
+                    )
+                content = _xsd_rt_category_class(match.group(1))
                 if not content or (in_class and pattern[pos + 1] == "P"):
                     raise _XPathUnsupported(
                         "re-match() category %r" % pattern[pos:pos + 6]
@@ -1353,7 +1359,7 @@ def _xpath_eval(ast, ctx, env):
     return nodes
 
 
-_xpath_ast_cache = {}
+_xpath_ast_cache: dict = {}
 
 
 def _xpath_check(expression, ctx, doc):
@@ -1650,6 +1656,17 @@ class _YangNode:
 
         def __setattr__(self, name, value):
             meta = self._yang_fields.get(name)
+            if meta is None and not name.startswith("_"):
+                # a typo'd field name would otherwise be set silently and
+                # ignored by validation, serde and rendering alike
+                raise AttributeError(
+                    "%s has no YANG field %r (fields: %s)"
+                    % (
+                        type(self).__name__,
+                        name,
+                        ", ".join(sorted(self._yang_fields)) or "none",
+                    )
+                )
             if meta is not None and meta.check is not None and value is not None:
                 path = "%s.%s" % (type(self).__name__, name)
                 if isinstance(value, list):
@@ -2095,6 +2112,7 @@ def validate_tree(*roots):
                 return
             fname, meta = matches[0]
             if meta.kind == "list":
+                assert meta.cls is not None  # list fields always carry cls
                 for key, _want in predicates:
                     if key is not None and not any(
                         m.yang_name == key
@@ -2114,6 +2132,7 @@ def validate_tree(*roots):
                     if value is not None and _xnode_has_data(value):
                         next_objects.append(value)
                 elif meta.kind == "list":
+                    assert meta.cls is not None
                     entries = list(value or [])
                     for key, want in predicates:
                         if key is None:

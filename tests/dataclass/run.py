@@ -1405,6 +1405,12 @@ class DataclassConformanceTests(unittest.TestCase):
                 {"dataclass-conformance:u": "9.5"},
             )
 
+    def test_unknown_attribute_rejected(self):
+        # a typo'd field name must fail loudly, not become a silently
+        # ignored instance attribute
+        with self.assertRaisesRegex(AttributeError, "no YANG field"):
+            self.tree.pbox.setting_typo = "x"
+
     def test_empty_presence_container_round_trips(self):
         # a present-but-empty presence container is real YANG data:
         # mark_present() carries it, decode sets it, encode emits {}
