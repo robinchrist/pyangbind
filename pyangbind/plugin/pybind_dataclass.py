@@ -2716,15 +2716,20 @@ class _Emitter:
         return path
 
     def _leafref_pred_must(self, node):
-        """Synthesized must expression enforcing a PREDICATED leafref:
-        the plain schema-path membership check (meta.leafref) ignores
-        path predicates, so `path "../x[k=current()/../y]/name"` would
-        accept any target value. The predicated node-set evaluated by
-        the XPath engine must contain the leaf's value instead. None
-        for predicate-free / unresolved / require-instance-false
-        leafrefs and for paths outside the evaluated XPath subset
-        (those keep only the superset schema-path check -- never
-        misjudged)."""
+        """Synthesized must expression enforcing an instance-scoped
+        leafref: the plain schema-path membership check (meta.leafref)
+        pools target values across the WHOLE tree, so both a predicated
+        path (`../x[k=current()/../y]/name`) and a plain relative path
+        (`../srv/name`, whose target set differs per parent instance)
+        would accept values from unrelated instances. RFC 7950 9.9
+        evaluates the path from the particular leaf instance, so every
+        relative or predicated leafref becomes a must checking that the
+        path's node-set (evaluated by the XPath engine from the leaf)
+        contains the leaf's value. None for absolute predicate-free
+        paths (the schema-path check is already exact there), for
+        unresolved / require-instance-false leafrefs, and for paths
+        outside the evaluated XPath subset (those keep only the
+        superset schema-path check -- never misjudged)."""
         if getattr(node, "i_leafref_ptr", None) is None:
             return None
         path_stmt = None
@@ -2733,8 +2738,11 @@ class _Emitter:
             if require is not None and require.arg == "false":
                 return None
             path_stmt = level.search_one("path") or path_stmt
-        if path_stmt is None or "[" not in path_stmt.arg:
+        if path_stmt is None:
             return None
+        arg = path_stmt.arg
+        if "[" not in arg and not arg.strip().startswith(".."):
+            return None  # absolute and predicate-free: exact already
         source = self._xpath_source(path_stmt)
         if source is None:
             return None
@@ -2906,6 +2914,11 @@ class _Emitter:
         args = [repr(child.arg), repr(self._module_name(child)), repr(kind)]
         if cls_name is not None:
             args.append("cls=%s" % cls_name)
+        scoped_must = (
+            self._leafref_pred_must(child)
+            if self.with_must_when and kind in ("leaf", "leaf-list")
+            else None
+        )
         if kind in ("leaf", "leaf-list"):
             if self.with_validation:
                 check = self.check_expr(child.search_one("type"), child)
@@ -2922,7 +2935,9 @@ class _Emitter:
             if identity_map is not None:
                 args.append("identity_map=%s" % identity_map)
             leafref = self._leafref_path(child)
-            if leafref is not None:
+            if leafref is not None and scoped_must is None:
+                # the synthesized instance-scoped must supersedes the
+                # whole-tree schema-path membership check
                 args.append("leafref=%r" % leafref)
         if kind == "leaf":
             mandatory = child.search_one("mandatory")
@@ -2953,15 +2968,13 @@ class _Emitter:
             args.append("case=%r" % (case,))
         if self.with_must_when:
             musts, whens = self._constraint_exprs(child, when_stmts)
-            if kind in ("leaf", "leaf-list"):
-                pred_must = self._leafref_pred_must(child)
-                if pred_must is not None:
-                    musts = musts + (
-                        (
-                            pred_must,
-                            "leafref has no target instance with this value",
-                        ),
-                    )
+            if scoped_must is not None:
+                musts = musts + (
+                    (
+                        scoped_must,
+                        "leafref has no target instance with this value",
+                    ),
+                )
             if musts:
                 args.append("musts=%r" % (musts,))
             if whens:

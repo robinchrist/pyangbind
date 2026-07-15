@@ -252,8 +252,17 @@ class DataclassMetadataTests(unittest.TestCase):
         self.assertEqual(self.top.Refs._yang_fields["tags"].min_elements, 1)
 
     def test_leafref_target_path(self):
+        # a RELATIVE leafref is enforced as an instance-scoped
+        # synthesized must (RFC 7950 9.9 evaluates the path from the
+        # particular leaf instance); the whole-tree schema-path check
+        # is superseded, so meta.leafref stays unset
         meta = self.top.Refs._yang_fields["active_server"]
-        self.assertEqual(meta.leafref, "/dataclass:refs/server/name")
+        self.assertIsNone(meta.leafref)
+        self.assertIn(
+            ("(../server/name) = current()",
+             "leafref has no target instance with this value"),
+            meta.musts,
+        )
 
     def test_require_instance_false_opts_out(self):
         self.assertIsNone(self.top.Refs._yang_fields["unchecked_server"].leafref)
@@ -332,7 +341,7 @@ class DataclassValidateTreeTests(unittest.TestCase):
     def test_leafref_violation(self):
         refs = self._valid_refs()
         refs.active_server = "nope"
-        self.assertIn("no matching instance", self._violations())
+        self.assertIn("no target instance", self._violations())
 
     def test_require_instance_false_not_checked(self):
         refs = self._valid_refs()
