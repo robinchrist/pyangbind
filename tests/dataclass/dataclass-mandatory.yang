@@ -1,0 +1,67 @@
+module dataclass-mandatory {
+  yang-version 1.1;
+  namespace "urn:dataclass-mandatory";
+  prefix dcm;
+
+  // Fixtures for RFC 7950 mandatory-node propagation: a non-presence
+  // container with a mandatory descendant is itself a mandatory node,
+  // so mandatory-ness climbs chains of empty non-presence containers
+  // and is stopped only by a presence container, an unselected case,
+  // or (for these bindings) a when-guarded container.
+
+  list item {
+    key "name";
+    leaf name { type string; }
+
+    container np-box {
+      leaf rt { type string; mandatory true; }
+    }
+
+    container np-chain {
+      container inner {
+        leaf deep { type string; mandatory true; }
+      }
+    }
+
+    container p-box {
+      presence "feature enabled";
+      leaf rt { type string; mandatory true; }
+    }
+
+    container np-choice-box {
+      choice encoding {
+        mandatory true;
+        case plain { leaf plain { type string; } }
+        case raw   { leaf raw   { type string; } }
+      }
+    }
+
+    container np-min {
+      leaf-list tags { type string; min-elements 1; }
+    }
+
+    choice mode {
+      case a {
+        container in-case {
+          leaf req { type string; mandatory true; }
+        }
+      }
+      case b { leaf other { type string; } }
+    }
+
+    container guarded {
+      when "../name = 'guardme'";
+      leaf req { type string; mandatory true; }
+    }
+
+    container np-must {
+      // fails on the implicitly-existing empty container, like
+      // libyang evaluating musts on implicit non-presence containers
+      must "x or y" {
+        error-message "np-must needs x or y";
+      }
+      leaf x { type string; }
+      leaf y { type string; }
+    }
+  }
+}

@@ -527,13 +527,16 @@ class _XNode:
 
 
 def _xnode_has_data(obj):
-    """YANG data-tree existence of a non-presence container instance."""
+    """YANG data-tree existence of a container instance. The bindings
+    auto-instantiate every container object, so holding data is the only
+    existence signal -- for presence containers too (present-but-empty
+    is not representable; an untouched presence container is absent)."""
     for fname, meta in getattr(type(obj), "_yang_fields", {}).items():
         value = getattr(obj, fname, None)
         if value is None:
             continue
         if meta.kind == "container":
-            if meta.presence or _xnode_has_data(value):
+            if _xnode_has_data(value):
                 return True
         elif isinstance(value, list):
             if value:
@@ -554,7 +557,7 @@ def _xnode_children(xnode):
         for fname, meta in getattr(type(holder), "_yang_fields", {}).items():
             value = getattr(holder, fname, None)
             if meta.kind == "container":
-                if value is not None and (meta.presence or _xnode_has_data(value)):
+                if value is not None and _xnode_has_data(value):
                     yield _XNode(value, meta, xnode)
             elif meta.kind == "list":
                 for entry in value or []:
@@ -1210,11 +1213,18 @@ def validate_tree(*roots):
     expressions (evaluated with an embedded XPath 1.0 subset engine
     wherever the constrained node exists; absolute paths resolve across
     all the given roots, so pass every module root the expressions
-    reach into). Existence follows YANG: a non-presence container
-    exists only if some descendant is set, and conditional rules
-    (mandatory, min-elements, mandatory choices) apply only where the
-    surrounding context exists. Collects every violation and raises a
-    single YangValidationError listing them all."""
+    reach into). Existence follows YANG (RFC 7950): a non-presence
+    container exists implicitly wherever its surrounding context
+    exists, so mandatory nodes inside it (mandatory leaves and
+    choices, min-elements) are enforced even when the container holds
+    no other data -- mandatory-ness propagates up through chains of
+    empty non-presence containers, and is stopped only by a presence
+    container (absent unless some descendant is set: present-but-empty
+    is not representable by these bindings), by an unselected case, or
+    by a `when`-guarded container (whose checks are skipped when it is
+    empty rather than misjudged). List entries and the passed roots
+    always count as existing context. Collects every violation and
+    raises a single YangValidationError listing them all."""
     errors = []
     leaf_values = {}  # target schema path -> values present in the trees
     leafref_uses = []  # (instance path, target schema path, value)
@@ -1242,11 +1252,18 @@ def validate_tree(*roots):
         except YangValidationError as exc:
             errors.append(str(exc))
 
-    def walk(node, path, schema_path, parent_module, xself):
+    def walk(node, path, schema_path, parent_module, xself, force_exists=False):
         fields = getattr(type(node), "_yang_fields", {})
         active_cases = {}  # choice -> set of cases with data
-        # (case-or-None, message): applies only if this node exists (and,
-        # when tied to a case, only if that case is the active one).
+        # Pending checks: (case-or-None, kind, payload). kind "error"
+        # carries a message; kind "must" carries queue_constraints args
+        # for a must on an empty non-presence container (RFC 7950: such
+        # a container exists implicitly, so libyang evaluates its musts
+        # too). A pending check fires once this node exists -- directly,
+        # by force (list entries, roots), or implicitly as an empty
+        # non-presence container hoisted into an existing parent context,
+        # in which case only case-free items travel (an implicitly
+        # existing node selects no case).
         pending = []
         exists = False
         for fname, meta in fields.items():
@@ -1258,9 +1275,23 @@ def validate_tree(*roots):
             if meta.kind == "container":
                 if value is not None:
                     xchild = _XNode(value, meta, xself)
-                    field_set = walk(value, fpath, fschema, meta.module, xchild)
-                    if field_set or meta.presence:
+                    field_set, hoisted = walk(value, fpath, fschema, meta.module, xchild)
+                    if field_set:
                         queue_constraints(meta, xchild, fpath)
+                    elif not meta.presence and not meta.whens:
+                        # Empty non-presence container: it exists
+                        # implicitly wherever this node exists, so its
+                        # hoisted mandatory checks and its own musts
+                        # stay pending here, gated on this container's
+                        # case (if any). An empty presence container is
+                        # absent and contributes nothing; a when-guarded
+                        # container is skipped, never misjudged.
+                        for _case, kind, payload in hoisted:
+                            pending.append((meta.case, kind, payload))
+                        if meta.musts:
+                            pending.append(
+                                (meta.case, "must", (meta, xchild, fpath))
+                            )
             elif meta.kind == "list":
                 entries = value or []
                 seen_keys = set()
@@ -1269,7 +1300,7 @@ def validate_tree(*roots):
                     key_text = _instance_key(entry, meta)
                     epath = "%s[%s]" % (fpath, index if key_text is None else key_text)
                     xentry = _XNode(entry, meta, xself)
-                    walk(entry, epath, fschema, meta.module, xentry)
+                    walk(entry, epath, fschema, meta.module, xentry, force_exists=True)
                     queue_constraints(meta, xentry, epath)
                     field_set = True
                     for key in meta.keys:
@@ -1302,6 +1333,7 @@ def validate_tree(*roots):
                     pending.append(
                         (
                             meta.case,
+                            "error",
                             "%s: %d entries, fewer than min-elements %d"
                             % (fpath, len(entries), meta.min_elements),
                         )
@@ -1338,6 +1370,7 @@ def validate_tree(*roots):
                     pending.append(
                         (
                             meta.case,
+                            "error",
                             "%s: %d elements, fewer than min-elements %d"
                             % (fpath, len(elements), meta.min_elements),
                         )
@@ -1363,7 +1396,9 @@ def validate_tree(*roots):
                         fpath,
                     )
                 if meta.kind == "leaf" and meta.mandatory and value is None:
-                    pending.append((meta.case, "%s: mandatory leaf is not set" % fpath))
+                    pending.append(
+                        (meta.case, "error", "%s: mandatory leaf is not set" % fpath)
+                    )
             if field_set:
                 exists = True
                 if meta.case is not None:
@@ -1377,16 +1412,34 @@ def validate_tree(*roots):
         for choice, mandatory in getattr(type(node), "_yang_choices", {}).items():
             if mandatory and not active_cases.get(choice):
                 pending.append(
-                    (None, "%s: no case of mandatory choice '%s' is set" % (path or "/", choice))
+                    (
+                        None,
+                        "error",
+                        "%s: no case of mandatory choice '%s' is set"
+                        % (path or "/", choice),
+                    )
                 )
-        if exists:
-            for case, message in pending:
-                if case is None or case[1] in active_cases.get(case[0], ()):
-                    errors.append(message)
-        return exists
+        hoisted = []
+        if exists or force_exists:
+            for case, kind, payload in pending:
+                if case is not None and case[1] not in active_cases.get(case[0], ()):
+                    continue
+                if kind == "error":
+                    errors.append(payload)
+                else:
+                    queue_constraints(*payload)
+        else:
+            # This node holds no data; whether its checks apply is the
+            # parent's call (they do if this is a non-presence container
+            # in an existing, when-free context). Case-tagged items stay
+            # behind: an implicitly existing node selects no case.
+            hoisted = [item for item in pending if item[0] is None]
+        return (exists, hoisted)
 
     for root in roots:
-        walk(root, "", "", None, doc)
+        # A passed root is the datastore itself: it exists, so even
+        # top-level mandatory nodes (legal, if unusual, YANG) apply.
+        walk(root, "", "", None, doc, force_exists=True)
     for path, target, value in leafref_uses:
         if value not in leaf_values.get(target, ()):
             errors.append(

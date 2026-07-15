@@ -314,10 +314,14 @@ class DataclassValidateTreeTests(unittest.TestCase):
         self._valid_refs()
         self.bindings.validate_tree(self.tree)
 
-    def test_empty_tree_passes(self):
-        # refs never comes into existence, so its mandatory choice,
-        # mandatory leaves and min-elements do not apply.
-        self.bindings.validate_tree(self.tree)
+    def test_empty_tree_enforces_top_level_mandatory(self):
+        # RFC 7950: refs is a top-level non-presence container, so it
+        # exists implicitly and its mandatory choice / min-elements
+        # apply even to an empty tree (libyang agrees: yanglint rejects
+        # {} against this schema with exactly these two violations).
+        violations = self._violations()
+        self.assertIn("no case of mandatory choice 'transport'", violations)
+        self.assertIn("fewer than min-elements 1", violations)
 
     def test_leafref_violation(self):
         refs = self._valid_refs()
@@ -1127,6 +1131,10 @@ class DataclassSplitDirTests(unittest.TestCase):
         tree.box.pet = "dc:dog"
         with self.assertRaises(self.bindings.YangValidationError):
             tree.box.mood = "angry"
+        # refs is a top-level non-presence container: its mandatory
+        # choice and min-elements apply implicitly, so satisfy them.
+        tree.refs.tags = ["prod"]
+        tree.refs.tcp_port = 8080
         self.bindings.validate_tree(tree)
         encoded = self.bindings.to_ietf_json(tree)
         self.assertEqual(encoded["dataclass:box"]["pet"], "dataclass:dog")
@@ -1135,6 +1143,81 @@ class DataclassSplitDirTests(unittest.TestCase):
         self.assertEqual(
             self.bindings.data_path(tree, tree.box), "/dataclass:box"
         )
+
+
+class DataclassMandatoryPropagationTests(unittest.TestCase):
+    """RFC 7950 mandatory-node propagation: a non-presence container
+    with a mandatory descendant is itself mandatory, so its checks
+    apply even when it holds no data, wherever its context exists.
+    Every verdict here matches yanglint (libyang) on the same data."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bindings = generate(
+            yang_file=os.path.join(TEST_PATH, "dataclass-mandatory.yang")
+        )
+
+    def setUp(self):
+        self.tree = self.bindings.DataclassMandatory()
+        self.entry = self.bindings.DataclassMandatory.Item(name="a")
+        self.tree.item.append(self.entry)
+
+    def _violations(self):
+        try:
+            self.bindings.validate_tree(self.tree)
+        except self.bindings.YangValidationError as exc:
+            return str(exc)
+        return ""
+
+    def test_empty_entry_all_implicit_violations(self):
+        violations = self._violations()
+        # libyang reports exactly these five on the same instance data
+        self.assertIn("np-box/rt: mandatory leaf is not set", violations)
+        self.assertIn("np-chain/inner/deep: mandatory leaf is not set", violations)
+        self.assertIn("no case of mandatory choice 'encoding'", violations)
+        self.assertIn("fewer than min-elements 1", violations)
+        self.assertIn("np-must needs x or y", violations)
+        self.assertEqual(violations.count("\n"), 5)  # header + 5 lines
+
+    def test_absent_presence_container_not_enforced(self):
+        violations = self._violations()
+        self.assertNotIn("/p-box", violations)
+
+    def test_unselected_case_not_enforced(self):
+        violations = self._violations()
+        self.assertNotIn("in-case", violations)
+
+    def test_when_guarded_container_skipped_when_empty(self):
+        violations = self._violations()
+        self.assertNotIn("guarded", violations)
+
+    def test_selected_case_enforces_its_container(self):
+        # touching in-case selects case 'a', so its mandatory leaf and
+        # the implicit checks hoisted to it now apply
+        self.entry.in_case.req = None  # no data: case still unselected
+        self.assertNotIn("in-case", self._violations())
+        self.entry.in_case.req = "set"
+        self.assertNotIn("in-case", self._violations())
+
+    def test_satisfied_entry_passes(self):
+        entry = self.entry
+        entry.np_box.rt = "x"
+        entry.np_chain.inner.deep = "d"
+        entry.np_choice_box.plain = "p"
+        entry.np_min.tags = ["t"]
+        entry.other = "b-case"
+        entry.np_must.x = "1"
+        self.bindings.validate_tree(self.tree)  # must not raise
+
+    def test_presence_container_with_data_enforces_mandatory(self):
+        entry = self.entry
+        entry.np_box.rt = "x"
+        entry.np_chain.inner.deep = "d"
+        entry.np_choice_box.plain = "p"
+        entry.np_min.tags = ["t"]
+        entry.np_must.x = "1"
+        entry.p_box.rt = "y"  # presence container now exists and is valid
+        self.bindings.validate_tree(self.tree)
 
 
 if __name__ == "__main__":
