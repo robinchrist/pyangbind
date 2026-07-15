@@ -451,6 +451,26 @@ _YANG_ANNOTATIONS: dict = {}
 _YANG_IDENTITY_BASES: dict = {}
 
 
+def mark_present(node, present=True):
+    """Mark a presence-container instance as explicitly present.
+
+    Containers are auto-instantiated and normally exist only once they
+    hold data; a presence container, though, may legitimately be
+    present-but-empty ("the feature is enabled"). This sets that flag
+    on the instance (invisible to __init__/repr/==); serde round-trips
+    it as the RFC 7951 empty object. Marking a non-presence container
+    is harmless -- existence checks consult the flag only where the
+    schema says `presence`. Returns `node`."""
+    object.__setattr__(node, "_yang_present", bool(present))
+    return node
+
+
+def is_marked_present(node):
+    """Whether mark_present() was set on this instance (holding data
+    makes a presence container present regardless of this flag)."""
+    return bool(getattr(node, "_yang_present", False))
+
+
 def annotate(node, member=None, index=None, /, **values):
     """Attach RFC 7952 metadata annotations to a data node instance.
 
@@ -559,15 +579,17 @@ class _XNode:
 
 def _xnode_has_data(obj):
     """YANG data-tree existence of a container instance. The bindings
-    auto-instantiate every container object, so holding data is the only
-    existence signal -- for presence containers too (present-but-empty
-    is not representable; an untouched presence container is absent)."""
+    auto-instantiate every container object, so a container exists once
+    it holds data -- or, for presence containers, when mark_present()
+    flagged the instance explicitly (present-but-empty)."""
     for fname, meta in getattr(type(obj), "_yang_fields", {}).items():
         value = getattr(obj, fname, None)
         if value is None:
             continue
         if meta.kind == "container":
-            if _xnode_has_data(value):
+            if _xnode_has_data(value) or (
+                meta.presence and getattr(value, "_yang_present", False)
+            ):
                 return True
         elif isinstance(value, list):
             if value:
@@ -588,7 +610,10 @@ def _xnode_children(xnode):
         for fname, meta in getattr(type(holder), "_yang_fields", {}).items():
             value = getattr(holder, fname, None)
             if meta.kind == "container":
-                if value is not None and _xnode_has_data(value):
+                if value is not None and (
+                    _xnode_has_data(value)
+                    or (meta.presence and getattr(value, "_yang_present", False))
+                ):
                     yield _XNode(value, meta, xnode)
             elif meta.kind == "list":
                 for entry in value or []:
@@ -1720,7 +1745,15 @@ def validate_tree(*roots):
             if meta.kind == "container":
                 if value is not None:
                     xchild = _XNode(value, meta, xself)
-                    field_set, hoisted = walk(value, fpath, fschema, meta.module, xchild)
+                    # an explicitly marked presence container exists even
+                    # while empty, so its mandatory checks apply
+                    marked = meta.presence and getattr(
+                        value, "_yang_present", False
+                    )
+                    field_set, hoisted = walk(
+                        value, fpath, fschema, meta.module, xchild,
+                        force_exists=marked,
+                    )
                     if field_set:
                         queue_constraints(meta, xchild, fpath)
                     elif not meta.presence:
@@ -1947,7 +1980,7 @@ def validate_tree(*roots):
             # in an existing, when-free context). Case-tagged items stay
             # behind: an implicitly existing node selects no case.
             hoisted = [item for item in pending if item[0] is None]
-        return (exists, hoisted)
+        return (exists or force_exists, hoisted)
 
     for root in roots:
         # A passed root is the datastore itself: it exists, so even
@@ -2225,10 +2258,9 @@ def to_ietf_json(root):
     a null-padded "@member" array for annotated leaf-list entries --
     but only where the annotated instance is itself encoded (metadata
     on unset leaves, or on leaf-list indexes past the end of the list,
-    is dropped). Limitations: a present-but-empty presence container is
-    omitted (the dataclass shape cannot express container absence)
-    unless annotated, and union members are encoded by their Python
-    value type."""
+    is dropped). A presence container marked with mark_present() is
+    encoded even while empty (the RFC 7951 empty object); union members
+    are encoded by their Python value type."""
 
     def encode_node(node, parent_module):
         out = {}
@@ -2239,7 +2271,9 @@ def to_ietf_json(root):
             if meta.kind == "container":
                 if value is not None:
                     child = encode_node(value, meta.module)
-                    if child:
+                    if child or (
+                        meta.presence and getattr(value, "_yang_present", False)
+                    ):
                         out[key] = child
             elif meta.kind == "list":
                 entries = [encode_node(entry, meta.module) for entry in value or []]
@@ -2548,16 +2582,11 @@ def _decode_into(node, data):
                 "%s has no member %r" % (type(node).__name__, key)
             ) from None
         if meta.kind == "container":
-            if meta.presence and not value:
-                # The bindings auto-instantiate containers and infer
-                # presence from held data, so a present-but-empty
-                # presence container has no representation -- decoding
-                # it silently as absent would change its meaning.
-                raise ValueError(
-                    "%r: a present-but-empty presence container is not "
-                    "representable by these bindings" % (key,)
-                )
-            _decode_into(getattr(node, fname), value)
+            child = getattr(node, fname)
+            if meta.presence:
+                # the member's presence in the JSON is the information
+                mark_present(child)
+            _decode_into(child, value)
         elif meta.kind == "list":
             entries = []
             for item in value:

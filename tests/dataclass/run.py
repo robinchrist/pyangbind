@@ -1405,12 +1405,27 @@ class DataclassConformanceTests(unittest.TestCase):
                 {"dataclass-conformance:u": "9.5"},
             )
 
-    def test_empty_presence_container_decode_rejected(self):
-        with self.assertRaisesRegex(ValueError, "not\\s+representable"):
-            self.bindings.from_ietf_json(
-                self.bindings.DataclassConformance,
-                {"dataclass-conformance:pbox": {}},
-            )
+    def test_empty_presence_container_round_trips(self):
+        # a present-but-empty presence container is real YANG data:
+        # mark_present() carries it, decode sets it, encode emits {}
+        decoded = self.bindings.from_ietf_json(
+            self.bindings.DataclassConformance,
+            {"dataclass-conformance:pbox": {}},
+        )
+        self.assertTrue(self.bindings.is_marked_present(decoded.pbox))
+        self.assertEqual(
+            self.bindings.to_ietf_json(decoded)["dataclass-conformance:pbox"],
+            {},
+        )
+        # built by hand: marking makes the empty container present
+        tree = self.bindings.DataclassConformance()
+        self.assertNotIn(
+            "dataclass-conformance:pbox", self.bindings.to_ietf_json(tree)
+        )
+        self.bindings.mark_present(tree.pbox)
+        self.assertEqual(
+            self.bindings.to_ietf_json(tree)["dataclass-conformance:pbox"], {}
+        )
         decoded = self.bindings.from_ietf_json(
             self.bindings.DataclassConformance,
             {"dataclass-conformance:pbox": {"setting": "s"}},

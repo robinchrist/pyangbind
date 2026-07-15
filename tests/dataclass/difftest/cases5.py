@@ -191,4 +191,26 @@ CASES = [
                 "dt-iir:strict": "/dt-iir:c/on"}),
         ],
     ),
+    dict(
+        name="present-empty-presence",
+        yang=M("dt-pep", """
+  container feature {
+    presence "feature enabled";
+    leaf tuning { type uint8; }
+  }
+  container strictbox {
+    presence "on";
+    leaf req { type string; mandatory true; }
+  }
+  leaf gated { type string; must "boolean(../feature)"; }
+"""),
+        docs=[
+            ("present-empty", {"dt-pep:feature": {}}),
+            ("present-with-data", {"dt-pep:feature": {"tuning": 3}}),
+            ("present-empty-satisfies-must", {"dt-pep:feature": {},
+                                              "dt-pep:gated": "x"}),
+            ("absent-fails-must", {"dt-pep:gated": "x"}),
+            ("present-empty-mandatory-violated", {"dt-pep:strictbox": {}}),
+        ],
+    ),
 ]
