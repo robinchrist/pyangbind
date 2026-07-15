@@ -92,12 +92,7 @@ CASES = [
 """),
         docs=[
             ("ref-ok", {"dt-lru:srv": [{"name": "a"}], "dt-lru:pick": "a"}),
-            # KNOWN LIMITATION (documented in CLAUDE.md / the plugin):
-            # a leafref union member is typed as plain str and validates
-            # nothing, so a dangling ref that no other member accepts is
-            # NOT caught -- libyang rejects it. Never put a leafref
-            # inside a union in proteus models.
-            # ("ref-dangling", {"dt-lru:srv": [{"name": "a"}], "dt-lru:pick": "b"}),
+            ("ref-dangling", {"dt-lru:srv": [{"name": "a"}], "dt-lru:pick": "b"}),
             ("num", {"dt-lru:srv": [{"name": "a"}], "dt-lru:pick": 80}),
         ],
     ),

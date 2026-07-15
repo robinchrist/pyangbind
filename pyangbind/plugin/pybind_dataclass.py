@@ -1402,6 +1402,10 @@ class _Check:
     # enumeration name -> declared/auto-assigned integer value, for the
     # XPath engine's enum-value(); None for non-enumerations
     enum_values: typing.Any = None
+    # set on a leafref UNION member: the member's own validate() covers
+    # only the target's syntax; validate_tree defers the required
+    # instance check ("(path) = current()") until the tree is complete
+    leafref_path: str | None = None
     bits: tuple = ()  # allowed bit names; () = unrestricted
     members: tuple = ()  # union member checks; at least one must pass
     fraction_digits: int = 0  # decimal64 precision; 0 = not a decimal64
@@ -1582,7 +1586,22 @@ def validate_tree(*roots):
     # when-guarded empty non-presence containers whose pending checks
     # apply only if their when conditions hold: resolved after the walk
     guarded_deferred = []
+    # union leaves with leafref members: whether the value is valid may
+    # depend on instance existence, judged once the tree is complete
+    union_ref_uses = []  # (check, leaf _XNode, value, instance path)
     doc = _XNode(None, None, None, roots=list(roots))
+
+    def union_members_flat(check):
+        for member in check.members:
+            if getattr(member, "base", None) == "union":
+                yield from union_members_flat(member)
+            else:
+                yield member
+
+    def union_has_leafref(check):
+        return check is not None and getattr(check, "base", None) == "union" and any(
+            member.leafref_path is not None for member in union_members_flat(check)
+        )
 
     def queue_constraints(meta, xnode, fpath):
         for expression, message in meta.musts:
@@ -1730,6 +1749,15 @@ def validate_tree(*roots):
                     note_value(fschema, element)
                     if meta.leafref is not None:
                         leafref_uses.append((epath, meta.leafref, element))
+                    if union_has_leafref(meta.check):
+                        union_ref_uses.append(
+                            (
+                                meta.check,
+                                _XNode(None, meta, xself, value=element, is_leaf=True),
+                                element,
+                                epath,
+                            )
+                        )
                     if meta.musts or meta.whens:
                         queue_constraints(
                             meta,
@@ -1771,6 +1799,15 @@ def validate_tree(*roots):
                         note_value(fschema, value)
                         if meta.leafref is not None:
                             leafref_uses.append((fpath, meta.leafref, value))
+                    if union_has_leafref(meta.check):
+                        union_ref_uses.append(
+                            (
+                                meta.check,
+                                _XNode(None, meta, xself, value=value, is_leaf=True),
+                                value,
+                                fpath,
+                            )
+                        )
                     field_set = True
                 if field_set and (meta.musts or meta.whens):
                     queue_constraints(
@@ -1857,6 +1894,33 @@ def validate_tree(*roots):
 
     for payload in guarded_deferred:
         resolve_guarded(payload)
+    for check, xnode, value, fpath in union_ref_uses:
+        # RFC 7950 9.12/9.9: the union is satisfied by a leafref member
+        # only if a target instance exists; a value that no other
+        # member accepts either is invalid.
+        satisfied = False
+        for member in union_members_flat(check):
+            try:
+                member.validate(value, fpath)
+            except ValueError:
+                continue
+            if member.leafref_path is None:
+                satisfied = True
+                break
+            try:
+                if _xpath_check(
+                    "(%s) = current()" % member.leafref_path, xnode, doc
+                ):
+                    satisfied = True
+                    break
+            except _XPathUnsupported:
+                satisfied = True  # cannot judge: accept, never misjudge
+                break
+        if not satisfied:
+            errors.append(
+                "%s: %r matches no union member (its leafref member has "
+                "no target instance with this value)" % (fpath, value)
+            )
     for path, target, value in leafref_uses:
         if value not in leaf_values.get(target, ()):
             errors.append(
@@ -2995,6 +3059,51 @@ class _Emitter:
             return None
         return ptr[0]
 
+    @staticmethod
+    def _find_data_child(stmt, name):
+        """Named data child of a stmt, descending transparently through
+        choice/case levels."""
+        for child in getattr(stmt, "i_children", []) or []:
+            if child.keyword in ("choice", "case"):
+                found = _Emitter._find_data_child(child, name)
+                if found is not None:
+                    return found
+            elif child.arg == name:
+                return child
+        return None
+
+    def _resolve_member_leafref_target(self, node, path_arg):
+        """Manually resolved target leaf of a leafref that pyang did NOT
+        resolve (a union member: pyang records i_leafref_ptr only for
+        direct leafrefs). Predicates are stripped -- only the target's
+        TYPE is wanted here; instance selection happens in the XPath
+        engine. Steps are matched by local name; None when any step
+        cannot be resolved."""
+        text = re.sub(r"\[[^\]]*\]", "", path_arg).strip()
+        if text.startswith("/"):
+            current = node
+            while current.parent is not None and current.keyword not in (
+                "module",
+                "submodule",
+            ):
+                current = current.parent
+        else:
+            current = node
+        for step in [s for s in text.split("/") if s]:
+            if step == "..":
+                current = getattr(current, "parent", None)
+                while current is not None and current.keyword in ("choice", "case"):
+                    current = current.parent
+                if current is None:
+                    return None
+                continue
+            current = self._find_data_child(current, step.split(":")[-1])
+            if current is None:
+                return None
+        if current.keyword not in ("leaf", "leaf-list"):
+            return None
+        return current
+
     # ---- origin comments ---------------------------------------------------
 
     @staticmethod
@@ -3101,6 +3210,36 @@ class _Emitter:
         if not fields or node.keyword != "leaf":
             return None
         return tuple(fields)
+
+    def _leafref_member_expr(self, member, member_resolved, node, depth):
+        """_Check expression for a leafref UNION member: the target's
+        type check for syntax, plus (require-instance permitting) the
+        prefix-normalized path for the deferred instance check. None
+        when the target cannot be resolved (the union then stays
+        unchecked -- wide open, never misjudged)."""
+        path_stmt = None
+        require_instance = True
+        level = member
+        while level is not None:
+            require = level.search_one("require-instance")
+            if require is not None and require.arg == "false":
+                require_instance = False
+            path_stmt = level.search_one("path") or path_stmt
+            typedef = getattr(level, "i_typedef", None)
+            level = typedef.search_one("type") if typedef is not None else None
+        if path_stmt is None:
+            return None
+        target = self._resolve_member_leafref_target(node, path_stmt.arg)
+        if target is None:
+            return None
+        expr = self.check_expr(target.search_one("type"), target, depth + 1)
+        if expr is None:
+            return None
+        if require_instance and self.with_must_when:
+            path_source = self._xpath_source(path_stmt)
+            if path_source is not None:
+                expr = "%s, leafref_path=%r)" % (expr[:-1], path_source)
+        return expr
 
     def _leafref_path_expr(self, node):
         """Prefix-normalized leafref path expression for deref(), or
@@ -3484,7 +3623,13 @@ class _Emitter:
         members = []
         if base.arg == "union":
             for member in base.search("type"):
-                member_expr = self.check_expr(member, node, depth + 1)
+                member_resolved = self._resolve_typedef_chain(member)
+                if member_resolved.arg == "leafref":
+                    member_expr = self._leafref_member_expr(
+                        member, member_resolved, node, depth
+                    )
+                else:
+                    member_expr = self.check_expr(member, node, depth + 1)
                 if member_expr is None:
                     return None  # one wide-open member makes the union wide open
                 members.append(member_expr)
