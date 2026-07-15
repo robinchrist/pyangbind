@@ -1,0 +1,39 @@
+module dataclass-conformance {
+  yang-version 1.1;
+  namespace "urn:dataclass-conformance";
+  prefix dcc;
+
+  // Fixtures for conformance details found by differential testing
+  // against libyang: invert-match patterns, nested choices, RFC 7951
+  // encoding strictness.
+
+  leaf inverted {
+    type string {
+      pattern "x.*" {
+        modifier invert-match;
+      }
+    }
+  }
+
+  container c {
+    choice outer {
+      case a {
+        leaf marker { type string; }
+        choice inner {
+          mandatory true;
+          case ia { leaf ia { type string; } }
+          case ib { leaf ib { type string; } }
+        }
+      }
+      case b { leaf ob { type string; } }
+    }
+  }
+
+  leaf big { type uint64; }
+  leaf e { type empty; }
+  leaf flags { type bits { bit b1; bit b2; } }
+  container pbox {
+    presence "explicitly enabled";
+    leaf setting { type string; }
+  }
+}

@@ -135,7 +135,8 @@ class additionally carries schema metadata in ClassVars -- invisible to
   unique / min- and max-elements, resolved leafref target path,
   choice/case membership)
 - ``_yang_name`` / ``_yang_module`` -- the class's own YANG identity
-- ``_yang_choices`` -- choice name -> mandatory flag, for the choices
+- ``_yang_choices`` -- choice name -> (mandatory flag, chain of
+  enclosing (choice, case) pairs), for the choices
   flattened into the class
 
 Serialisation (opt-in with ``--dataclass-serde``)
@@ -374,7 +375,9 @@ class _FieldMeta:
     keys: tuple = ()  # list key field names
     unique: tuple = ()  # list `unique` groups, tuples of field names
     leafref: str | None = None  # absolute schema path of the leafref target
-    case: tuple | None = None  # (choice, case) of choice-flattened fields
+    # chain of (choice, case) pairs a choice-flattened field came out
+    # of, outermost first; None for fields outside any choice
+    case: tuple | None = None
     natives: tuple = ()  # native Python classes (native-type hints), for serde
     # XPath constraints, evaluated by validate_tree where the node exists:
     musts: tuple = ()  # ((expression, error-message | None), ...)
@@ -1068,6 +1071,7 @@ class _Check:
     ranges: tuple = ()
     lengths: tuple = ()
     patterns: tuple = ()  # every pattern must fullmatch (YANG ANDs them)
+    inverted_patterns: tuple = ()  # `modifier invert-match`: must NOT fullmatch
     values: tuple = ()  # allowed enum/identityref strings; () = unrestricted
     bits: tuple = ()  # allowed bit names; () = unrestricted
     members: tuple = ()  # union member checks; at least one must pass
@@ -1113,6 +1117,11 @@ class _Check:
             if re.fullmatch(pattern, value) is None:
                 raise YangValidationError(
                     "%s: %r does not match pattern %r" % (path, value, pattern)
+                )
+        for pattern in self.inverted_patterns:
+            if re.fullmatch(pattern, value) is not None:
+                raise YangValidationError(
+                    "%s: %r matches invert-match pattern %r" % (path, value, pattern)
                 )
 
     def _check_base_type(self, value, path):
@@ -1402,18 +1411,25 @@ def validate_tree(*roots):
             if field_set:
                 exists = True
                 if meta.case is not None:
-                    active_cases.setdefault(meta.case[0], set()).add(meta.case[1])
+                    # setting a field selects every case on its chain,
+                    # innermost and enclosing ones alike
+                    for choice, case_name in meta.case:
+                        active_cases.setdefault(choice, set()).add(case_name)
         for choice, cases in active_cases.items():
             if len(cases) > 1:
                 errors.append(
                     "%s: fields of multiple cases of choice '%s' are set: %s"
                     % (path or "/", choice, ", ".join(sorted(cases)))
                 )
-        for choice, mandatory in getattr(type(node), "_yang_choices", {}).items():
+        for choice, (mandatory, chain) in getattr(
+            type(node), "_yang_choices", {}
+        ).items():
             if mandatory and not active_cases.get(choice):
+                # a nested mandatory choice applies only while every
+                # enclosing case on its chain is the selected one
                 pending.append(
                     (
-                        None,
+                        chain or None,
                         "error",
                         "%s: no case of mandatory choice '%s' is set"
                         % (path or "/", choice),
@@ -1422,7 +1438,10 @@ def validate_tree(*roots):
         hoisted = []
         if exists or force_exists:
             for case, kind, payload in pending:
-                if case is not None and case[1] not in active_cases.get(case[0], ()):
+                if case is not None and any(
+                    case_name not in active_cases.get(choice, ())
+                    for choice, case_name in case
+                ):
                     continue
                 if kind == "error":
                     errors.append(payload)
@@ -1614,12 +1633,28 @@ def _decode_value(meta, value):
         # a bits leaf: space-separated bit names -> bits dataclass
         names = set(value.split())
         table = getattr(meta.cls, "_yang_fields", {})
+        known = {m.yang_name for m in table.values()}
+        unknown = names - known
+        if unknown:
+            raise ValueError(
+                "%r: unknown bit name(s) %s" % (value, sorted(unknown))
+            )
         return meta.cls(**{f: True for f, m in table.items() if m.yang_name in names})
-    if meta.encode == "int64" and isinstance(value, str):
+    if meta.encode == "int64":
+        # RFC 7951 6.1: 64-bit integers are encoded as JSON strings
+        if not isinstance(value, str):
+            raise ValueError(
+                "%r: a 64-bit integer must be a JSON string (RFC 7951)" % (value,)
+            )
         return int(value)
     if meta.encode == "decimal":
         return decimal.Decimal(str(value))
     if meta.encode == "empty":
+        # RFC 7951 6.9: type empty is encoded as [null]
+        if value != [None]:
+            raise ValueError(
+                "%r: an empty leaf must be encoded as [null] (RFC 7951)" % (value,)
+            )
         return True  # [null] -> presence
     if meta.encode == "binary" and isinstance(value, str):
         return base64.b64decode(value)
@@ -1734,6 +1769,15 @@ def _decode_into(node, data):
                 "%s has no member %r" % (type(node).__name__, key)
             ) from None
         if meta.kind == "container":
+            if meta.presence and not value:
+                # The bindings auto-instantiate containers and infer
+                # presence from held data, so a present-but-empty
+                # presence container has no representation -- decoding
+                # it silently as absent would change its meaning.
+                raise ValueError(
+                    "%r: a present-but-empty presence container is not "
+                    "representable by these bindings" % (key,)
+                )
             _decode_into(getattr(node, fname), value)
         elif meta.kind == "list":
             entries = []
@@ -2703,7 +2747,7 @@ class _Emitter:
         chain = self._typedef_chain(type_stmt)
         base = chain[-1]
 
-        ranges, lengths, patterns = [], [], []
+        ranges, lengths, patterns, inverted = [], [], [], []
         for level in chain:
             range_stmt = level.search_one("range")
             if range_stmt is not None:
@@ -2714,7 +2758,11 @@ class _Emitter:
             for pattern_stmt in level.search("pattern"):
                 pattern = _python_pattern(pattern_stmt.arg)
                 if pattern is not None:
-                    patterns.append(pattern)
+                    modifier = pattern_stmt.search_one("modifier")
+                    if modifier is not None and modifier.arg == "invert-match":
+                        inverted.append(pattern)
+                    else:
+                        patterns.append(pattern)
 
         values = ()
         bits = ()
@@ -2763,6 +2811,8 @@ class _Emitter:
             args.append("lengths=%r" % (tuple(lengths),))
         if patterns:
             args.append("patterns=%r" % (tuple(patterns),))
+        if inverted:
+            args.append("inverted_patterns=%r" % (tuple(inverted),))
         if values:
             args.append("values=%r" % (values,))
         if bits:
@@ -2868,10 +2918,13 @@ class _Emitter:
     def _flattened_children(stmt):
         """Config-true data children with choice/case flattened away.
         Returns (entries, choices): entries as (child, case, when_stmts)
-        triples where `case` is the (outermost) (choice, case) pair a
-        child was flattened out of (or None) and `when_stmts` the `when`
-        statements of the flattened-away choice/case levels; choices as
-        choice name -> mandatory."""
+        triples where `case` is the chain of (choice, case) pairs a
+        child was flattened out of, outermost first (or None), and
+        `when_stmts` the `when` statements of the flattened-away
+        choice/case levels; choices as choice name -> (mandatory,
+        chain-of-enclosing-(choice, case)-pairs) -- a nested choice's
+        mandatory-ness applies only while its enclosing case is the
+        selected one."""
         entries, choices = [], {}
         for child in getattr(stmt, "i_children", []) or []:
             if child.keyword not in _DATA_KEYWORDS:
@@ -2880,23 +2933,32 @@ class _Emitter:
                 continue
             if child.keyword == "choice":
                 mandatory = child.search_one("mandatory")
-                choices[child.arg] = mandatory is not None and mandatory.arg == "true"
+                choices[child.arg] = (
+                    mandatory is not None and mandatory.arg == "true",
+                    (),
+                )
                 choice_whens = tuple(
                     w for w in (child.search_one("when"),) if w is not None
                 )
                 for case in getattr(child, "i_children", []) or []:
                     if case.keyword == "case":
+                        tag = ((child.arg, case.arg),)
                         case_whens = choice_whens + tuple(
                             w for w in (case.search_one("when"),) if w is not None
                         )
                         sub_entries, sub_choices = _Emitter._flattened_children(case)
                         entries.extend(
-                            (sub, (child.arg, case.arg), case_whens + sub_whens)
-                            for sub, _, sub_whens in sub_entries
+                            (sub, tag + (sub_case or ()), case_whens + sub_whens)
+                            for sub, sub_case, sub_whens in sub_entries
                         )
-                        choices.update(sub_choices)
+                        choices.update(
+                            (name, (sub_mandatory, tag + sub_chain))
+                            for name, (sub_mandatory, sub_chain) in sub_choices.items()
+                        )
                     elif case.keyword in _DATA_KEYWORDS:  # shorthand case
-                        entries.append((case, (child.arg, case.arg), choice_whens))
+                        entries.append(
+                            (case, ((child.arg, case.arg),), choice_whens)
+                        )
             else:
                 entries.append((child, None, ()))
         return entries, choices

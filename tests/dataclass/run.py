@@ -255,13 +255,15 @@ class DataclassMetadataTests(unittest.TestCase):
         self.assertIsNone(self.top.Refs._yang_fields["unchecked_server"].leafref)
 
     def test_choice_membership_and_mandatory(self):
+        # case is a chain of (choice, case) pairs, outermost first;
+        # _yang_choices values are (mandatory, enclosing-case-chain)
         self.assertEqual(
-            self.top.Refs._yang_fields["tcp_port"].case, ("transport", "tcp")
+            self.top.Refs._yang_fields["tcp_port"].case, (("transport", "tcp"),)
         )
         self.assertEqual(
-            self.top.Refs._yang_fields["udp_port"].case, ("transport", "udp")
+            self.top.Refs._yang_fields["udp_port"].case, (("transport", "udp"),)
         )
-        self.assertEqual(self.top.Refs._yang_choices, {"transport": True})
+        self.assertEqual(self.top.Refs._yang_choices, {"transport": (True, ())})
 
     def test_bits_meta(self):
         meta = self.top.Box._yang_fields["bits_with_default"]
@@ -1218,6 +1220,99 @@ class DataclassMandatoryPropagationTests(unittest.TestCase):
         entry.np_must.x = "1"
         entry.p_box.rt = "y"  # presence container now exists and is valid
         self.bindings.validate_tree(self.tree)
+
+
+class DataclassConformanceTests(unittest.TestCase):
+    """Conformance details pinned by differential testing against
+    libyang (yanglint agrees with every verdict here)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bindings = generate(
+            "--dataclass-serde",
+            yang_file=os.path.join(TEST_PATH, "dataclass-conformance.yang"),
+        )
+
+    def setUp(self):
+        self.tree = self.bindings.DataclassConformance()
+
+    def _violations(self):
+        try:
+            self.bindings.validate_tree(self.tree)
+        except self.bindings.YangValidationError as exc:
+            return str(exc)
+        return ""
+
+    def test_invert_match_pattern(self):
+        self.tree.inverted = "yes"  # does not match x.* -> valid
+        with self.assertRaisesRegex(
+            self.bindings.YangValidationError, "invert-match"
+        ):
+            self.tree.inverted = "xyz"
+
+    def test_nested_mandatory_choice_gated_by_outer_case(self):
+        # outer case not selected: inner's mandatory does not apply
+        self.tree.c.ob = "b-case"
+        self.assertEqual(self._violations(), "")
+        # selecting outer case 'a' without an inner case is a violation
+        tree2 = self.bindings.DataclassConformance()
+        tree2.c.marker = "m"
+        self.tree = tree2
+        self.assertIn("mandatory choice 'inner'", self._violations())
+        # and satisfying inner clears it
+        tree2.c.ia = "x"
+        self.assertEqual(self._violations(), "")
+
+    def test_nested_choice_field_selects_whole_chain(self):
+        # ia (case ia of inner, inside case a of outer) conflicts with
+        # ob (case b of outer): outer exclusivity is still caught
+        self.tree.c.ia = "x"
+        self.tree.c.ob = "y"
+        self.assertIn("multiple cases of choice 'outer'", self._violations())
+
+    def test_int64_decode_requires_string(self):
+        decoded = self.bindings.from_ietf_json(
+            self.bindings.DataclassConformance, {"dataclass-conformance:big": "5"}
+        )
+        self.assertEqual(decoded.big, 5)
+        with self.assertRaisesRegex(ValueError, "RFC 7951"):
+            self.bindings.from_ietf_json(
+                self.bindings.DataclassConformance, {"dataclass-conformance:big": 5}
+            )
+
+    def test_empty_decode_requires_null_array(self):
+        decoded = self.bindings.from_ietf_json(
+            self.bindings.DataclassConformance, {"dataclass-conformance:e": [None]}
+        )
+        self.assertIs(decoded.e, True)
+        with self.assertRaisesRegex(ValueError, "RFC 7951"):
+            self.bindings.from_ietf_json(
+                self.bindings.DataclassConformance, {"dataclass-conformance:e": True}
+            )
+
+    def test_bits_decode_rejects_unknown_names(self):
+        decoded = self.bindings.from_ietf_json(
+            self.bindings.DataclassConformance,
+            {"dataclass-conformance:flags": "b1 b2"},
+        )
+        self.assertTrue(decoded.flags.b1 and decoded.flags.b2)
+        with self.assertRaisesRegex(ValueError, "unknown bit"):
+            self.bindings.from_ietf_json(
+                self.bindings.DataclassConformance,
+                {"dataclass-conformance:flags": "b1 b9"},
+            )
+
+    def test_empty_presence_container_decode_rejected(self):
+        with self.assertRaisesRegex(ValueError, "not\\s+representable"):
+            self.bindings.from_ietf_json(
+                self.bindings.DataclassConformance,
+                {"dataclass-conformance:pbox": {}},
+            )
+        decoded = self.bindings.from_ietf_json(
+            self.bindings.DataclassConformance,
+            {"dataclass-conformance:pbox": {"setting": "s"}},
+        )
+        self.assertEqual(decoded.pbox.setting, "s")
 
 
 if __name__ == "__main__":
