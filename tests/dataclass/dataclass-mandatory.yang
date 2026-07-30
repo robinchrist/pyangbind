@@ -54,6 +54,15 @@ module dataclass-mandatory {
       leaf req { type string; mandatory true; }
     }
 
+    // a when-guarded mandatory LEAF: required only where its when
+    // holds (RFC 7950 7.6.5), like frr-route-map's goto-value
+    leaf gate { type string; }
+    leaf gated-req {
+      when "../gate = 'open'";
+      type string;
+      mandatory true;
+    }
+
     container np-must {
       // fails on the implicitly-existing empty container, like
       // libyang evaluating musts on implicit non-presence containers

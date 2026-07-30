@@ -1240,6 +1240,18 @@ class DataclassMandatoryPropagationTests(unittest.TestCase):
         violations = self._violations()
         self.assertNotIn("guarded", violations)
 
+    def test_when_guarded_mandatory_leaf(self):
+        # RFC 7950 7.6.5: required only where its when condition holds
+        self.assertNotIn("gated-req", self._violations())
+        self.entry.gate = "closed"
+        self.assertNotIn("gated-req", self._violations())
+        self.entry.gate = "open"
+        self.assertIn(
+            "gated-req: mandatory leaf is not set", self._violations()
+        )
+        self.entry.gated_req = "x"
+        self.assertNotIn("gated-req", self._violations())
+
     def test_selected_case_enforces_its_container(self):
         # touching in-case selects case 'a', so its mandatory leaf and
         # the implicit checks hoisted to it now apply
@@ -1267,6 +1279,58 @@ class DataclassMandatoryPropagationTests(unittest.TestCase):
         entry.np_must.x = "1"
         entry.p_box.rt = "y"  # presence container now exists and is valid
         self.bindings.validate_tree(self.tree)
+
+
+class DataclassSiblingNameCollisionTests(unittest.TestCase):
+    """Same-named sibling leaves from different modules (an augment's
+    case leaf shadowing a leaf name of the target module -- legal, names
+    are namespaced per module, RFC 7950 6.2.1) must land on distinct
+    python fields: the same-module leaf keeps the bare name, the foreign
+    one is module-qualified, mirroring RFC 7951 member qualification."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bindings = generate(
+            os.path.join(TEST_PATH, "dataclass-collide-aug.yang"),
+            "--dataclass-serde",
+            yang_file=os.path.join(TEST_PATH, "dataclass-collide.yang"),
+        )
+
+    def test_distinct_fields_with_correct_metadata(self):
+        box = self.bindings.DataclassCollide.Box
+        fields = box._yang_fields
+        self.assertIn("list_name", fields)
+        self.assertIn("dataclass_collide_aug_list_name", fields)
+        self.assertEqual(fields["list_name"].module, "dataclass-collide")
+        self.assertEqual(
+            fields["dataclass_collide_aug_list_name"].module,
+            "dataclass-collide-aug",
+        )
+        self.assertEqual(
+            fields["dataclass_collide_aug_list_name"].yang_name, "list-name"
+        )
+
+    def test_choice_exclusivity_between_the_two(self):
+        tree = self.bindings.DataclassCollide()
+        tree.box.list_name = "a"
+        tree.box.dataclass_collide_aug_list_name = "b"
+        with self.assertRaises(self.bindings.YangValidationError) as ctx:
+            self.bindings.validate_tree(tree)
+        self.assertIn("choice 'which'", str(ctx.exception))
+
+    def test_serde_qualifies_the_foreign_member(self):
+        tree = self.bindings.DataclassCollide()
+        tree.box.dataclass_collide_aug_list_name = "b"
+        encoded = self.bindings.to_ietf_json(tree)
+        self.assertEqual(
+            encoded["dataclass-collide:box"],
+            {"dataclass-collide-aug:list-name": "b"},
+        )
+        decoded = self.bindings.from_ietf_json(
+            self.bindings.DataclassCollide, encoded
+        )
+        self.assertEqual(decoded.box.dataclass_collide_aug_list_name, "b")
+        self.assertIsNone(decoded.box.list_name)
 
 
 class DataclassConformanceTests(unittest.TestCase):

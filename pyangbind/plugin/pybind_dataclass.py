@@ -1961,9 +1961,28 @@ def validate_tree(*roots):
                     and meta.mandatory
                     and value is None
                 ):
-                    pending.append(
-                        (meta.case, "error", "%s: mandatory leaf is not set" % fpath)
-                    )
+                    message = "%s: mandatory leaf is not set" % fpath
+                    if meta.whens:
+                        # RFC 7950 7.6.5/7.21.5: a when-guarded mandatory
+                        # leaf is required only where its when conditions
+                        # hold -- defer until the finished tree can judge
+                        # them (like when-guarded empty containers).
+                        pending.append(
+                            (
+                                meta.case,
+                                "guarded-error",
+                                (
+                                    meta,
+                                    _XNode(
+                                        None, meta, xself,
+                                        value=None, is_leaf=True,
+                                    ),
+                                    message,
+                                ),
+                            )
+                        )
+                    else:
+                        pending.append((meta.case, "error", message))
             if field_set:
                 exists = True
                 if meta.case is not None:
@@ -2001,8 +2020,8 @@ def validate_tree(*roots):
                     continue
                 if kind == "error":
                     errors.append(payload)
-                elif kind == "guarded":
-                    guarded_deferred.append(payload)
+                elif kind in ("guarded", "guarded-error"):
+                    guarded_deferred.append((kind, payload))
                 else:
                     queue_constraints(*payload)
         else:
@@ -2018,27 +2037,44 @@ def validate_tree(*roots):
         # top-level mandatory nodes (legal, if unusual, YANG) apply.
         walk(root, "", "", None, doc, force_exists=True)
 
-    def resolve_guarded(payload):
-        meta, xchild, fpath, items = payload
+    def whens_hold(meta, xchild):
         for expression, self_context in meta.whens:
             context = xchild if self_context else xchild.parent
             try:
                 if not _xpath_check(expression, context, doc):
-                    return
+                    return False
             except _XPathUnsupported:
-                return  # outside the subset: skip, never misjudge
+                return False  # outside the subset: skip, never misjudge
+        return True
+
+    def resolve_guarded_error(payload):
+        # a when-guarded UNSET mandatory leaf: required only where its
+        # when conditions hold; its musts never apply (it is absent)
+        meta, xchild, message = payload
+        if whens_hold(meta, xchild):
+            errors.append(message)
+
+    def resolve_guarded(payload):
+        meta, xchild, fpath, items = payload
+        if not whens_hold(meta, xchild):
+            return
         for _case, kind, inner in items:
             if kind == "error":
                 errors.append(inner)
             elif kind == "guarded":
                 resolve_guarded(inner)
+            elif kind == "guarded-error":
+                resolve_guarded_error(inner)
             else:
                 queue_constraints(*inner)
         if meta.musts:
             queue_constraints(meta, xchild, fpath)
 
-    for payload in guarded_deferred:
-        resolve_guarded(payload)
+    for kind, payload in guarded_deferred:
+        if kind == "guarded":
+            resolve_guarded(payload)
+        else:
+            resolve_guarded_error(payload)
     for check, xnode, value, fpath in union_ref_uses:
         # RFC 7950 9.12/9.9: the union is satisfied by a leafref member
         # only if a target instance exists; a value that no other
@@ -4227,8 +4263,30 @@ class _Emitter:
         used_class_names = set()
         field_metas = []
         entries, choices = self._flattened_children(stmt)
-        for child, case, when_stmts in entries:
+        # Sibling data nodes may share a local name when they come from
+        # different modules (an augment's case leaf may legally shadow a
+        # same-named leaf of the target module: names are namespaced per
+        # module, RFC 7950 6.2.1). A python dataclass has one flat
+        # namespace, so qualify the colliding foreign-module fields with
+        # their module name, mirroring RFC 7951's member qualification
+        # (same-module child stays bare).
+        parent_module = self._module_name(stmt)
+        name_counts = {}
+        for child, _case, _when in entries:
+            base = safe_name(child.arg)
+            name_counts[base] = name_counts.get(base, 0) + 1
+        field_names = {}
+        taken_fnames = set()
+        for child, _case, _when in entries:
             fname = safe_name(child.arg)
+            if name_counts[fname] > 1 and self._module_name(child) != parent_module:
+                fname = safe_name("%s_%s" % (self._module_name(child), child.arg))
+            while fname in taken_fnames:
+                fname += "_"
+            taken_fnames.add(fname)
+            field_names[id(child)] = fname
+        for child, case, when_stmts in entries:
+            fname = field_names[id(child)]
             if self.with_origin_comments:
                 comment = self._origin_comment(child)
                 if comment is not None:

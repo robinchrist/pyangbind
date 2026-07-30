@@ -1,0 +1,15 @@
+module dataclass-collide-aug {
+  yang-version 1.1;
+  namespace "urn:dataclass-collide-aug";
+  prefix dca;
+
+  import dataclass-collide {
+    prefix dcc;
+  }
+
+  augment "/dcc:box/dcc:which" {
+    case aug-name {
+      leaf list-name { type string; }
+    }
+  }
+}

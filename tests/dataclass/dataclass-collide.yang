@@ -1,0 +1,18 @@
+module dataclass-collide {
+  yang-version 1.1;
+  namespace "urn:dataclass-collide";
+  prefix dcc;
+
+  // Fixture for same-named sibling data nodes from different modules:
+  // dataclass-collide-aug augments the choice with a case whose leaf
+  // is also called list-name (legal: names are namespaced per module,
+  // RFC 7950 6.2.1). The dataclass backend must give the two leaves
+  // distinct python fields (the foreign one module-qualified).
+  container box {
+    choice which {
+      case base-name {
+        leaf list-name { type string; }
+      }
+    }
+  }
+}
