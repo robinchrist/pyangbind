@@ -853,6 +853,98 @@ class DataclassNativeInetTests(unittest.TestCase):
         self.assertEqual(net.gateway, "192.0.2.1")
 
 
+class DataclassLeafrefUnionTests(unittest.TestCase):
+    """Leafref union members (dataclass-leafref-union.yang): pyang never
+    resolves i_leafref_ptr for them, so the codegen resolves the target
+    manually -- the annotation and assignment check carry the TARGET's
+    type, natives/serde see through to a native-IP target, and
+    validate_tree enforces the instance requirement."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bindings = generate(
+            "--dataclass-serde",
+            yang_file=os.path.join(TEST_PATH, "dataclass-leafref-union.yang"),
+        )
+
+    def setUp(self):
+        import ipaddress
+
+        self.ip = ipaddress
+        b = self.bindings
+        self.root = b.DataclassLeafrefUnion()
+        self.root.server.append(
+            b.DataclassLeafrefUnion.Server(
+                name="alpha", port=179, address=self.ip.IPv4Address("192.0.2.1")
+            )
+        )
+
+    def test_annotations_carry_target_type(self):
+        anns = self.bindings.DataclassLeafrefUnion.__annotations__
+        self.assertEqual(anns["pick"], "str | int | None")
+        # the target's uint16 -> int, NOT a degraded plain str
+        self.assertEqual(anns["pick_port"], "int | typing.Literal['auto'] | None")
+        # typedef-wrapped leafref member resolves too
+        self.assertEqual(anns["pick_typedef"], "str | int | None")
+        # native-IP target surfaces in the annotation
+        self.assertEqual(
+            anns["pick_addr"], "ipaddress.IPv4Address | typing.Literal['any'] | None"
+        )
+
+    def test_assignment_applies_target_type_check(self):
+        self.root.pick_port = 8080
+        self.root.pick_port = "auto"
+        with self.assertRaises(self.bindings.YangValidationError):
+            self.root.pick_port = "8080"  # not 'auto', target type is int
+        with self.assertRaises(self.bindings.YangValidationError):
+            self.root.pick_port = 70000  # outside the target's uint16 range
+        with self.assertRaises(self.bindings.YangValidationError):
+            self.root.pick_addr = "192.0.2.1"  # native target: string spelling
+
+    def test_validate_tree_enforces_instance_requirement(self):
+        b = self.bindings
+        self.root.pick = "alpha"
+        self.root.pick_port = 179
+        self.root.pick_typedef = "alpha"
+        self.root.pick_addr = self.ip.IPv4Address("192.0.2.1")
+        b.validate_tree(self.root)
+        for field, dangling in (
+            ("pick", "nonexistent"),
+            ("pick_port", 4444),
+            ("pick_typedef", "nonexistent"),
+            ("pick_addr", self.ip.IPv4Address("203.0.113.9")),
+        ):
+            setattr(self.root, field, dangling)
+            with self.assertRaises(b.YangValidationError):
+                b.validate_tree(self.root)
+            setattr(self.root, field, None)
+
+    def test_non_leafref_members_still_satisfy_the_union(self):
+        self.root.pick = 42  # uint8 member: no instance required
+        self.root.pick_port = "auto"
+        self.root.pick_addr = "any"
+        self.bindings.validate_tree(self.root)
+
+    def test_member_check_carries_leafref_path(self):
+        meta = self.bindings.DataclassLeafrefUnion._yang_fields["pick_port"]
+        self.assertEqual(meta.check.members[0].leafref_path, "../server/port")
+        self.assertIsNone(meta.check.members[1].leafref_path)
+
+    def test_native_target_serde_round_trip(self):
+        b = self.bindings
+        self.root.pick_addr = self.ip.IPv4Address("192.0.2.1")
+        encoded = b.to_ietf_json(self.root)
+        self.assertEqual(
+            encoded["dataclass-leafref-union:pick-addr"], "192.0.2.1"
+        )
+        decoded = b.from_ietf_json(b.DataclassLeafrefUnion, encoded)
+        self.assertEqual(decoded, self.root)
+        # the enum member's string round-trips as a string
+        self.root.pick_addr = "any"
+        decoded = b.from_ietf_json(b.DataclassLeafrefUnion, b.to_ietf_json(self.root))
+        self.assertEqual(decoded.pick_addr, "any")
+
+
 class DataclassNativeHintTests(unittest.TestCase):
     """The --dataclass-native-type option (dataclass-native-hint.yang):
     generator-supplied native Python classes for schema-defined string

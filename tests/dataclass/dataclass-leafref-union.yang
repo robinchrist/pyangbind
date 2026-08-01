@@ -1,0 +1,74 @@
+module dataclass-leafref-union {
+  yang-version 1.1;
+  namespace "urn:tests:dataclass-leafref-union";
+  prefix dlu;
+
+  import ietf-inet-types {
+    prefix inet;
+  }
+
+  description
+    "Fixture for leafref-as-union-member handling: pyang resolves
+     i_leafref_ptr only for direct leafrefs, so union members must be
+     resolved manually at codegen. Covers a string target, a non-string
+     (uint16) target whose type must surface in the annotation and the
+     assignment check, a leafref hidden behind a typedef, and a
+     native-IP target (annotation, ip-union serde coercion).";
+
+  typedef server-ref {
+    type leafref {
+      path "/dlu:server/dlu:name";
+    }
+  }
+
+  list server {
+    key "name";
+    leaf name {
+      type string;
+    }
+    leaf port {
+      type uint16;
+    }
+    leaf address {
+      type inet:ipv4-address-no-zone;
+    }
+  }
+
+  leaf pick {
+    type union {
+      type leafref {
+        path "../server/name";
+      }
+      type uint8;
+    }
+  }
+
+  leaf pick-port {
+    type union {
+      type leafref {
+        path "../server/port";
+      }
+      type enumeration {
+        enum auto;
+      }
+    }
+  }
+
+  leaf pick-typedef {
+    type union {
+      type server-ref;
+      type uint8;
+    }
+  }
+
+  leaf pick-addr {
+    type union {
+      type leafref {
+        path "../server/address";
+      }
+      type enumeration {
+        enum any;
+      }
+    }
+  }
+}

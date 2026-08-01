@@ -3263,12 +3263,12 @@ class _Emitter:
         if t.arg == "union":
             out = []
             for member in t.search("type"):
-                for path in self._collect_natives(member, None, depth + 1):
+                for path in self._collect_natives(member, node, depth + 1):
                     if path not in out:
                         out.append(path)
             return tuple(out)
         if t.arg == "leafref":
-            target = self._leafref_target(node, depth)
+            target = self._resolved_leafref_target(type_stmt, node, depth)
             if target is not None:
                 return self._collect_natives(target.search_one("type"), target, depth + 1)
         return ()
@@ -3334,7 +3334,7 @@ class _Emitter:
                         members.append(part)
             return " | ".join(members) if members else "str"
         if t.arg == "leafref":
-            target = self._leafref_target(node, depth)
+            target = self._resolved_leafref_target(type_stmt, node, depth)
             if target is not None:
                 return self.annotation(target.search_one("type"), target, depth + 1)
             return "str"
@@ -3357,6 +3357,33 @@ class _Emitter:
         if ptr is None or ptr[0].search_one("type") is None:
             return None
         return ptr[0]
+
+    def _chain_path_stmt(self, type_stmt):
+        """The (deepest) `path` statement of a leafref type, found
+        anywhere on its typedef chain, or None."""
+        path_stmt = None
+        for level in self._typedef_chain(type_stmt):
+            path_stmt = level.search_one("path") or path_stmt
+        return path_stmt
+
+    def _resolved_leafref_target(self, type_stmt, node, depth):
+        """The leaf a leafref points at: pyang's i_leafref_ptr for a
+        direct leafref (depth 0), else -- union members, where pyang
+        records no pointer -- resolved manually from the path
+        statement. None when it cannot be resolved (annotation and
+        natives then degrade to str / none, never fail codegen)."""
+        target = self._leafref_target(node, depth)
+        if target is not None:
+            return target
+        if node is None:
+            return None
+        path_stmt = self._chain_path_stmt(type_stmt)
+        if path_stmt is None:
+            return None
+        target = self._resolve_member_leafref_target(node, path_stmt.arg)
+        if target is None or target.search_one("type") is None:
+            return None
+        return target
 
     @staticmethod
     def _find_data_child(stmt, name):
@@ -3516,16 +3543,12 @@ class _Emitter:
         prefix-normalized path for the deferred instance check. None
         when the target cannot be resolved (the union then stays
         unchecked -- wide open, never misjudged)."""
-        path_stmt = None
         require_instance = True
-        level = member
-        while level is not None:
+        for level in self._typedef_chain(member):
             require = level.search_one("require-instance")
             if require is not None and require.arg == "false":
                 require_instance = False
-            path_stmt = level.search_one("path") or path_stmt
-            typedef = getattr(level, "i_typedef", None)
-            level = typedef.search_one("type") if typedef is not None else None
+        path_stmt = self._chain_path_stmt(member)
         if path_stmt is None:
             return None
         target = self._resolve_member_leafref_target(node, path_stmt.arg)
@@ -3674,7 +3697,7 @@ class _Emitter:
             return native[2]
         t = self._resolve_typedef_chain(type_stmt)
         if t.arg == "leafref":
-            target = self._leafref_target(node, depth)
+            target = self._resolved_leafref_target(type_stmt, node, depth)
             if target is not None:
                 return self._encode_tag(target.search_one("type"), target, depth + 1)
             return None
@@ -3690,14 +3713,15 @@ class _Emitter:
             return "identityref"
         if t.arg == "bits" and t.search("bit"):
             return "bits"
-        if t.arg == "union" and self._union_has_native_member(t, depth):
+        if t.arg == "union" and self._union_has_native_member(t, node, depth):
             return "ip-union"
         return None
 
-    def _union_has_native_member(self, resolved_union, depth):
+    def _union_has_native_member(self, resolved_union, node, depth):
         """Whether a union mixes native (ipaddress or native-type-hinted)
         members with other types (its values then need the ip-union
-        serde coercion)."""
+        serde coercion). Leafref members count when their target's type
+        is native."""
         if depth > 16:
             return False
         for member in resolved_union.search("type"):
@@ -3706,8 +3730,16 @@ class _Emitter:
             if self._native_hint(member) is not None:
                 return True
             inner = self._resolve_typedef_chain(member)
-            if inner.arg == "union" and self._union_has_native_member(inner, depth + 1):
+            if inner.arg == "union" and self._union_has_native_member(
+                inner, node, depth + 1
+            ):
                 return True
+            if inner.arg == "leafref":
+                target = self._resolved_leafref_target(member, node, depth + 1)
+                if target is not None and self._encode_tag(
+                    target.search_one("type"), target, depth + 1
+                ) in ("ip-address", "ip-prefix", "native"):
+                    return True
         return False
 
     def _identityref_map_name(self, type_stmt, node, depth=0):
