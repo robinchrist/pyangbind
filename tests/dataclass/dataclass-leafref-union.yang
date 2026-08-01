@@ -78,6 +78,14 @@ module dataclass-leafref-union {
     }
   }
 
+  leaf acl-direct {
+    // Direct (non-union) cross-module leafref, for the
+    // ignore-external-leafrefs escape hatch of validate_tree.
+    type leafref {
+      path "/lists:acl/lists:name";
+    }
+  }
+
   leaf pick-addr {
     type union {
       type leafref {

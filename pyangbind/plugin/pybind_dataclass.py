@@ -1677,7 +1677,7 @@ class _YangNode:
             object.__setattr__(self, name, value)
 
 
-def validate_tree(*roots):
+def validate_tree(*roots, ignore_external_leafrefs=False):
     """Whole-tree validation of one or more binding roots.
 
     Checks everything on-assignment validation cannot: re-validates every
@@ -1700,7 +1700,17 @@ def validate_tree(*roots):
     by a `when`-guarded container (whose checks are skipped when it is
     empty rather than misjudged). List entries and the passed roots
     always count as existing context. Collects every violation and
-    raises a single YangValidationError listing them all."""
+    raises a single YangValidationError listing them all.
+
+    ``ignore_external_leafrefs=True`` (opt-in; the default enforces
+    everything) skips the referential-integrity check for leafrefs --
+    direct and union members -- whose target lies in a module with NO
+    root among ``roots``: those references are assumed valid instead
+    of failing as dangling, for validating one tree in isolation.
+    Targets inside the passed roots' modules stay fully enforced, as
+    does everything non-referential. Limitation: an absolute
+    PREDICATED cross-module leafref is enforced via a synthesized
+    ``must`` and is not skipped."""
     errors = []
     leaf_values = {}  # target schema path -> values present in the trees
     leafref_uses = []  # (instance path, target schema path, value)
@@ -1715,6 +1725,23 @@ def validate_tree(*roots):
     # existence of the referenced node, judged once the tree is complete
     ii_uses = []  # (value, instance path, require_instance)
     doc = _XNode(None, None, None, roots=list(roots))
+
+    root_modules = set()
+    for root in roots:
+        for meta in getattr(type(root), "_yang_fields", {}).values():
+            root_modules.add(meta.module)
+
+    def leafref_is_external(path):
+        # A leafref target is external when its (module-qualified,
+        # absolute) path leads into a module none of the passed roots
+        # belongs to. Relative paths stay within the tree holding the
+        # leaf; an unqualified absolute path targets the leaf's own
+        # module -- both are internal by construction.
+        if not path.startswith("/"):
+            return False
+        first = path.lstrip("/").split("/", 1)[0]
+        module, sep, _ = first.partition(":")
+        return bool(sep) and module not in root_modules
 
     def union_members_flat(check):
         for member in check.members:
@@ -2088,6 +2115,11 @@ def validate_tree(*roots):
             if member.leafref_path is None:
                 satisfied = True
                 break
+            if ignore_external_leafrefs and leafref_is_external(
+                member.leafref_path
+            ):
+                satisfied = True  # target tree not passed: assumed valid
+                break
             try:
                 if _xpath_check(
                     "(%s) = current()" % member.leafref_path, xnode, doc
@@ -2102,11 +2134,6 @@ def validate_tree(*roots):
                 "%s: %r matches no union member (its leafref member has "
                 "no target instance with this value)" % (fpath, value)
             )
-
-    root_modules = set()
-    for root in roots:
-        for meta in getattr(type(root), "_yang_fields", {}).values():
-            root_modules.add(meta.module)
 
     def resolve_instance_identifier(text, fpath, require_instance):
         steps = _parse_instance_identifier(text)
@@ -2222,6 +2249,8 @@ def validate_tree(*roots):
     for text, fpath, require_instance in ii_uses:
         resolve_instance_identifier(text, fpath, require_instance)
     for path, target, value in leafref_uses:
+        if ignore_external_leafrefs and leafref_is_external(target):
+            continue  # target tree not passed: assumed valid
         if value not in leaf_values.get(target, ()):
             errors.append(
                 "%s: leafref %r has no matching instance at %s" % (path, value, target)

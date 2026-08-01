@@ -963,6 +963,28 @@ class DataclassLeafrefUnionTests(unittest.TestCase):
         with self.assertRaises(b.YangValidationError):
             b.validate_tree(self.root, self.lists)
 
+    def test_ignore_external_leafrefs_flag(self):
+        b = self.bindings
+        self.root.pick_acl = "no-such-list"  # union member, cross-module
+        self.root.acl_direct = "no-such-acl"  # direct, cross-module
+        # strict default: refs into a module with no passed root dangle
+        with self.assertRaises(b.YangValidationError):
+            b.validate_tree(self.root)
+        # opt-in: external refs are assumed valid
+        b.validate_tree(self.root, ignore_external_leafrefs=True)
+        # a PASSED target root keeps full enforcement despite the flag
+        with self.assertRaises(b.YangValidationError):
+            b.validate_tree(self.root, self.lists, ignore_external_leafrefs=True)
+        self.root.pick_acl = "edge-in"
+        self.root.acl_direct = "edge-in"
+        b.validate_tree(self.root, self.lists, ignore_external_leafrefs=True)
+
+    def test_ignore_external_leafrefs_keeps_internal_refs_strict(self):
+        b = self.bindings
+        self.root.pick = "nonexistent"  # union member, same-tree target
+        with self.assertRaises(b.YangValidationError):
+            b.validate_tree(self.root, ignore_external_leafrefs=True)
+
     def test_native_target_serde_round_trip(self):
         b = self.bindings
         self.root.pick_addr = self.ip.IPv4Address("192.0.2.1")
