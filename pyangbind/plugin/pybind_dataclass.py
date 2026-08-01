@@ -3380,7 +3380,7 @@ class _Emitter:
         path_stmt = self._chain_path_stmt(type_stmt)
         if path_stmt is None:
             return None
-        target = self._resolve_member_leafref_target(node, path_stmt.arg)
+        target = self._resolve_member_leafref_target(node, path_stmt)
         if target is None or target.search_one("type") is None:
             return None
         return target
@@ -3398,23 +3398,23 @@ class _Emitter:
                 return child
         return None
 
-    def _resolve_member_leafref_target(self, node, path_arg):
+    def _resolve_member_leafref_target(self, node, path_stmt):
         """Manually resolved target leaf of a leafref that pyang did NOT
         resolve (a union member: pyang records i_leafref_ptr only for
         direct leafrefs). Predicates are stripped -- only the target's
         TYPE is wanted here; instance selection happens in the XPath
-        engine. Steps are matched by local name; None when any step
-        cannot be resolved."""
-        text = re.sub(r"\[[^\]]*\]", "", path_arg).strip()
+        engine. An absolute path starts at the module named by its
+        first step's prefix (resolved through the module that wrote
+        the path expression, RFC 7950 6.4.1 -- so cross-module targets
+        resolve); steps are then matched by local name. None when any
+        step cannot be resolved."""
+        text = re.sub(r"\[[^\]]*\]", "", path_stmt.arg).strip()
         if text.startswith("/"):
-            current = node
-            while current.parent is not None and current.keyword not in (
-                "module",
-                "submodule",
-            ):
-                current = current.parent
+            current = self._abs_path_root(node, path_stmt, text)
         else:
             current = node
+        if current is None:
+            return None
         for step in [s for s in text.split("/") if s]:
             if step == "..":
                 current = getattr(current, "parent", None)
@@ -3428,6 +3428,29 @@ class _Emitter:
                 return None
         if current.keyword not in ("leaf", "leaf-list"):
             return None
+        return current
+
+    def _abs_path_root(self, node, path_stmt, text):
+        """The module statement an absolute leafref path starts in: the
+        first step's prefix resolved through the module that wrote the
+        path expression, falling back (unprefixed first step, or a
+        prefix the context cannot resolve) to the module holding the
+        node itself."""
+        first = next((s for s in text.split("/") if s), "")
+        prefix, sep, _ = first.partition(":")
+        if sep:
+            source = getattr(path_stmt, "i_orig_module", None) or path_stmt.top
+            mapped = (getattr(source, "i_prefixes", None) or {}).get(prefix)
+            if mapped is not None:
+                module = self.ctx.get_module(*mapped)
+                if module is not None:
+                    return module
+        current = node
+        while current.parent is not None and current.keyword not in (
+            "module",
+            "submodule",
+        ):
+            current = current.parent
         return current
 
     # ---- origin comments ---------------------------------------------------
@@ -3551,7 +3574,7 @@ class _Emitter:
         path_stmt = self._chain_path_stmt(member)
         if path_stmt is None:
             return None
-        target = self._resolve_member_leafref_target(node, path_stmt.arg)
+        target = self._resolve_member_leafref_target(node, path_stmt)
         if target is None:
             return None
         expr = self.check_expr(target.search_one("type"), target, depth + 1)

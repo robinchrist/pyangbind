@@ -33,6 +33,7 @@ def generate(*flags, output_format="pybind-dataclass", yang_file=None, search_pa
     if pyang is None:
         raise RuntimeError("Could not locate `pyang` executable.")
     yang_file = yang_file or os.path.join(TEST_PATH, "dataclass.yang")
+    yang_files = [yang_file] if isinstance(yang_file, str) else list(yang_file)
     search_path = search_path or TEST_PATH
     cmd = [
         pyang,
@@ -43,7 +44,7 @@ def generate(*flags, output_format="pybind-dataclass", yang_file=None, search_pa
         "-p",
         search_path,
         *flags,
-        yang_file,
+        *yang_files,
     ]
     code = subprocess.check_output(cmd, stderr=subprocess.PIPE, env={"PYTHONPATH": BASE_DIR})
     module = types.ModuleType("dataclass_bindings")
@@ -864,7 +865,10 @@ class DataclassLeafrefUnionTests(unittest.TestCase):
     def setUpClass(cls):
         cls.bindings = generate(
             "--dataclass-serde",
-            yang_file=os.path.join(TEST_PATH, "dataclass-leafref-union.yang"),
+            yang_file=[
+                os.path.join(TEST_PATH, "dataclass-leafref-union.yang"),
+                os.path.join(TEST_PATH, "dataclass-leafref-union-lists.yang"),
+            ],
         )
 
     def setUp(self):
@@ -878,6 +882,9 @@ class DataclassLeafrefUnionTests(unittest.TestCase):
                 name="alpha", port=179, address=self.ip.IPv4Address("192.0.2.1")
             )
         )
+        self.lists = b.DataclassLeafrefUnionLists()
+        self.lists.acl.append(b.DataclassLeafrefUnionLists.Acl(name="edge-in"))
+        self.lists.acl6.append(b.DataclassLeafrefUnionLists.Acl6(name="edge6-in"))
 
     def test_annotations_carry_target_type(self):
         anns = self.bindings.DataclassLeafrefUnion.__annotations__
@@ -929,6 +936,32 @@ class DataclassLeafrefUnionTests(unittest.TestCase):
         meta = self.bindings.DataclassLeafrefUnion._yang_fields["pick_port"]
         self.assertEqual(meta.check.members[0].leafref_path, "../server/port")
         self.assertIsNone(meta.check.members[1].leafref_path)
+
+    def test_cross_module_annotation_and_checks(self):
+        # target types resolve across the module boundary
+        anns = self.bindings.DataclassLeafrefUnion.__annotations__
+        self.assertEqual(anns["pick_acl"], "str | None")
+        # both all-leafref members carry prefix-normalized paths
+        meta = self.bindings.DataclassLeafrefUnion._yang_fields["pick_acl"]
+        self.assertEqual(
+            [m.leafref_path for m in meta.check.members],
+            [
+                "/dataclass-leafref-union-lists:acl/dataclass-leafref-union-lists:name",
+                "/dataclass-leafref-union-lists:acl6/dataclass-leafref-union-lists:name",
+            ],
+        )
+
+    def test_cross_module_instance_check(self):
+        b = self.bindings
+        # a name from either target list satisfies the union
+        self.root.pick_acl = "edge-in"
+        b.validate_tree(self.root, self.lists)
+        self.root.pick_acl = "edge6-in"
+        b.validate_tree(self.root, self.lists)
+        # dangling: no instance in either list -> rejected
+        self.root.pick_acl = "nonexistent"
+        with self.assertRaises(b.YangValidationError):
+            b.validate_tree(self.root, self.lists)
 
     def test_native_target_serde_round_trip(self):
         b = self.bindings

@@ -6,6 +6,9 @@ module dataclass-leafref-union {
   import ietf-inet-types {
     prefix inet;
   }
+  import dataclass-leafref-union-lists {
+    prefix lists;
+  }
 
   description
     "Fixture for leafref-as-union-member handling: pyang resolves
@@ -58,6 +61,20 @@ module dataclass-leafref-union {
     type union {
       type server-ref;
       type uint8;
+    }
+  }
+
+  leaf pick-acl {
+    // The frr-bgp-route-map comm-list-name shape: a union made up
+    // ENTIRELY of leafrefs, each an absolute path into ANOTHER
+    // module (resolved via the first step's prefix).
+    type union {
+      type leafref {
+        path "/lists:acl/lists:name";
+      }
+      type leafref {
+        path "/lists:acl6/lists:name";
+      }
     }
   }
 

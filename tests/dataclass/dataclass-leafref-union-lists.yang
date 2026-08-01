@@ -1,0 +1,24 @@
+module dataclass-leafref-union-lists {
+  yang-version 1.1;
+  namespace "urn:tests:dataclass-leafref-union-lists";
+  prefix dlul;
+
+  description
+    "Target module for dataclass-leafref-union's cross-module union
+     members: two name-keyed lists a union of leafrefs points into
+     (the frr-bgp-route-map comm-list-name shape).";
+
+  list acl {
+    key "name";
+    leaf name {
+      type string;
+    }
+  }
+
+  list acl6 {
+    key "name";
+    leaf name {
+      type string;
+    }
+  }
+}
