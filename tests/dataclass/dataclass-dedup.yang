@@ -1,0 +1,32 @@
+module dataclass-dedup {
+  yang-version 1.1;
+  namespace "http://example.net/dataclass-dedup";
+  prefix dd;
+
+  grouping endpoint {
+    container inner {
+      leaf host { type string { length "1..16"; } }
+      leaf port { type uint16; }
+      leaf enabled { type empty; }
+    }
+    list peer {
+      key "name";
+      leaf name { type string; }
+      leaf weight { type uint8 { range "1..10"; } }
+    }
+  }
+
+  container a { uses endpoint; }
+  container b { uses endpoint; }
+  // same grouping, but a refine makes `inner` differ from a/b's
+  container c {
+    uses endpoint {
+      refine "inner/port" { default "22"; }
+    }
+  }
+  list group {
+    key "name";
+    leaf name { type string; }
+    container a { uses endpoint; }
+  }
+}

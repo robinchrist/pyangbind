@@ -184,6 +184,22 @@ XPaths (opt-in with ``--dataclass-xpaths``)
     their interpolations evaluate eagerly at literal-creation time, so a
     class-level template cannot defer to instance state.)
 
+Class deduplication (opt-in with ``--dataclass-dedup-classes``)
+    Every container / list-entry class is emitted at module level and
+    referenced from its parent by a class-body alias (``Trace =
+    Trace_2``), and classes whose generated source is identical are
+    emitted once and shared by every place that uses them. A schema that
+    reuses large groupings at many places (Junos: the whole configuration
+    tree again under ``groups``, interfaces/protocols under every
+    routing-instance and logical-system) otherwise produces one nested
+    class per use and becomes too large to import. Sharing is decided on
+    the emitted text, so it never merges classes that differ in anything
+    (metadata, docstrings, schema paths with ``--dataclass-xpaths``).
+    Visible differences: ``type(node).__name__`` / ``repr`` name the
+    shared class, and two positions with the same shape share one class
+    object. The cache is per data module, so each module file in split
+    mode stays self-contained.
+
 Multi-file output (opt-in with ``--dataclass-split-dir DIR``)
     Writes the bindings as a Python package under DIR instead of one
     (potentially huge) module on ``-o``/stdout: one file per YANG module
@@ -2825,6 +2841,17 @@ class PybindDataclassPlugin(plugin.PyangPlugin):
             "to see where a node comes from",
         )
         group.add_option(
+            "--dataclass-dedup-classes",
+            dest="dataclass_dedup_classes",
+            action="store_true",
+            default=False,
+            help="Emit container/list classes at module level, aliased "
+            "from their parent class, and emit classes with identical "
+            "generated source only once (shared by every use site). "
+            "Needed for schemas that reuse big groupings in many places, "
+            "whose nested output would otherwise be too large to import",
+        )
+        group.add_option(
             "--dataclass-split-dir",
             dest="dataclass_split_dir",
             default=None,
@@ -2912,6 +2939,7 @@ class PybindDataclassPlugin(plugin.PyangPlugin):
                 ctx.opts, "no_dataclass_native_ip_types", False
             ),
             native_type_hints=getattr(ctx.opts, "dataclass_native_types", None),
+            dedup_classes=getattr(ctx.opts, "dataclass_dedup_classes", False),
         )
 
 
@@ -3161,7 +3189,7 @@ class _Emitter:
         self, ctx, identity_values, with_validation, with_defaults,
         with_origin_comments=False, with_serde=False, with_xpaths=False,
         identity_canonical=None, with_must_when=True, with_native_ip_types=True,
-        native_type_hints=None,
+        native_type_hints=None, dedup_classes=False,
     ):
         self.ctx = ctx
         self.identity_values = identity_values
@@ -3201,6 +3229,11 @@ class _Emitter:
         # after the reusable types. Empty when there are none (or
         # --no-dataclass-annotations was given).
         self.annotation_lines = []
+        # --dataclass-dedup-classes: module-level tree classes, keyed by
+        # their generated body; reset per data module (build_dataclasses)
+        self.dedup_classes = dedup_classes
+        self.shared_class_lines = []
+        self.shared_class_by_body = {}
 
     def _register_reusable(self, key, preferred_name, build_lines):
         """Register (once) a module-level reusable type. `key` dedups repeated
@@ -4335,6 +4368,40 @@ class _Emitter:
                 "%s%s: %s | None = %s" % (indent, fname, ann, scalar_default or "None")
             )
 
+    def emit_shared_class(self, stmt, cname):
+        """--dataclass-dedup-classes: emit the class for `stmt` at module
+        level (into shared_class_lines), or reuse an already emitted class
+        with identical source, and return its module-level name. Nested
+        classes are emitted first (by the recursion), so every alias in a
+        class body refers to a class that is already defined."""
+        saved = self.lines
+        self.lines = []
+        try:
+            self.emit_node_class(stmt, cname, "")
+            lines = self.lines
+        finally:
+            self.lines = saved
+        # lines[0:2] are the decorator and the `class` line: the name is not
+        # part of the identity, everything else is
+        body = "\n".join(lines[2:])
+        name = self.shared_class_by_body.get(body)
+        if name is None:
+            # numbered, not "_"-extended like the reusable types: a common
+            # name (Interface, Unit, ...) can have dozens of variants.
+            # class_name() never produces "_<digits>", so this is unambiguous
+            name = cname
+            n = 1
+            while name in self.reusable_names:
+                n += 1
+                name = "%s_%d" % (cname, n)
+            # shares the namespace of the reusable types (star-imported in
+            # split mode) and the module classes
+            self.reusable_names.add(name)
+            self.shared_class_by_body[body] = name
+            lines[1] = lines[1].replace("class %s" % cname, "class %s" % name, 1)
+            self.shared_class_lines.extend(lines)
+        return name
+
     def emit_node_class(self, stmt, cname, indent):
         """Emit a dataclass for a container / list entry / module."""
         self.lines.append("%s@dataclasses.dataclass" % indent)
@@ -4380,7 +4447,11 @@ class _Emitter:
                 while child_cname in used_class_names:
                     child_cname += "_"
                 used_class_names.add(child_cname)
-                self.emit_node_class(child, child_cname, body_indent)
+                if self.dedup_classes:
+                    shared = self.emit_shared_class(child, child_cname)
+                    self.lines.append("%s%s = %s" % (body_indent, child_cname, shared))
+                else:
+                    self.emit_node_class(child, child_cname, body_indent)
                 if child.keyword == "container":
                     self.lines.append(
                         "%s%s: %s = dataclasses.field(default_factory=%s)"
@@ -4474,7 +4545,7 @@ def build_dataclasses(
     ctx, modules, fd, with_validation=True, with_defaults=True,
     with_origin_comments=False, with_serde=False, with_xpaths=False,
     split_dir=None, with_must_when=True, with_annotations=True,
-    with_native_ip_types=True, native_type_hints=None,
+    with_native_ip_types=True, native_type_hints=None, dedup_classes=False,
 ):
     identity_values, identity_canonical, identity_bases = _build_identity_values(ctx)
 
@@ -4483,7 +4554,7 @@ def build_dataclasses(
         with_origin_comments=with_origin_comments, with_serde=with_serde,
         with_xpaths=with_xpaths, identity_canonical=identity_canonical,
         with_must_when=with_must_when, with_native_ip_types=with_native_ip_types,
-        native_type_hints=native_type_hints,
+        native_type_hints=native_type_hints, dedup_classes=dedup_classes,
     )
     # Reserve the top-level module class names so a reusable type (emitted in
     # the same module namespace) can never shadow one of them.
@@ -4505,7 +4576,12 @@ def build_dataclasses(
     segments = []  # (module, its slice of emitter.lines), for split mode
     for module in data_modules:
         start = len(emitter.lines)
+        emitter.shared_class_lines = []
+        emitter.shared_class_by_body = {}
         emitter.emit_node_class(module, class_name(module.arg), "")
+        if emitter.shared_class_lines:
+            # shared tree classes precede the module class that aliases them
+            emitter.lines[start:start] = emitter.shared_class_lines
         segments.append((module, emitter.lines[start:]))
     if not data_modules:
         emitter.lines.append("# (none of the input modules define config data nodes)")

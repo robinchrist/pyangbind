@@ -1650,5 +1650,114 @@ class DataclassConformanceTests(unittest.TestCase):
         self.assertEqual(decoded.pbox.setting, "s")
 
 
+class DataclassDedupClassesTests(unittest.TestCase):
+    """--dataclass-dedup-classes: identical subtrees share one class."""
+
+    YANG = os.path.join(TEST_PATH, "dataclass-dedup.yang")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bindings = generate(
+            "--dataclass-serde", "--dataclass-dedup-classes", yang_file=cls.YANG
+        )
+        cls.nested = generate("--dataclass-serde", yang_file=cls.YANG)
+
+    def test_identical_subtrees_share_one_class(self):
+        root = self.bindings.DataclassDedup
+        self.assertIs(root.A.Inner, root.B.Inner)
+        self.assertIs(root.A.Peer, root.B.Peer)
+        # a/b themselves are different nodes (yang name differs) ...
+        self.assertIsNot(root.A, root.B)
+        # ... but a list entry's `a` has the same shape as the top-level one
+        self.assertIs(root.Group.A, root.A)
+        self.assertEqual(self.bindings._source.count("class Inner"), 2)
+
+    def test_differing_subtrees_stay_separate(self):
+        root = self.bindings.DataclassDedup
+        self.assertIsNot(root.C.Inner, root.A.Inner)
+        self.assertEqual(root.A.Inner.__name__, "Inner")
+        self.assertEqual(root.C.Inner.__name__, "Inner_2")
+        self.assertEqual(root.C().inner.port, 22)
+        self.assertIsNone(root.A().inner.port)
+        self.assertIs(root.C.Peer, root.A.Peer)
+
+    def test_classes_are_module_level(self):
+        tree_classes = [
+            line for line in self.bindings._source.splitlines()
+            if line.rstrip().endswith("(_YangNode):")
+        ]
+        self.assertTrue(tree_classes)
+        for line in tree_classes:
+            self.assertTrue(line.startswith("class "), line)
+
+    def test_instances_are_independent(self):
+        tree = self.bindings.DataclassDedup()
+        tree.a.inner.host = "x"
+        self.assertIsNone(tree.b.inner.host)
+        self.assertIsNot(tree.a.inner, tree.b.inner)
+
+    def test_validation_and_serde_match_nested_output(self):
+        data = {
+            "dataclass-dedup:a": {
+                "inner": {"host": "h1", "port": 80, "enabled": [None]},
+                "peer": [{"name": "p", "weight": 3}],
+            },
+            "dataclass-dedup:b": {"inner": {"port": 443}},
+            "dataclass-dedup:group": [{"name": "g", "a": {"inner": {"host": "h2"}}}],
+        }
+        for bindings in (self.bindings, self.nested):
+            tree = bindings.from_ietf_json(bindings.DataclassDedup, data)
+            bindings.validate_tree(tree)
+            out = bindings.to_ietf_json(tree)
+            self.assertEqual(out["dataclass-dedup:a"], data["dataclass-dedup:a"])
+            self.assertEqual(out["dataclass-dedup:group"], data["dataclass-dedup:group"])
+            self.assertEqual(out["dataclass-dedup:b"]["inner"]["port"], 443)
+            with self.assertRaises(bindings.YangValidationError):
+                tree.b.inner.host = "x" * 17
+            with self.assertRaises(bindings.YangValidationError):
+                tree.group[0].a.peer = [type(tree.a.peer[0])(name="q", weight=11)]
+
+    def test_xpaths_keep_per_position_classes(self):
+        bindings = generate(
+            "--dataclass-xpaths", "--dataclass-dedup-classes", yang_file=self.YANG
+        )
+        root = bindings.DataclassDedup
+        self.assertIsNot(root.A.Inner, root.B.Inner)
+        self.assertEqual(root.B.Inner._yang_schema_path, "/dataclass-dedup:b/inner")
+        tree = root()
+        self.assertEqual(
+            bindings.data_path(tree, tree.b.inner), "/dataclass-dedup:b/inner"
+        )
+
+    def test_split_dir(self):
+        import importlib
+        import tempfile
+
+        tmp = tempfile.mkdtemp()
+        try:
+            subprocess.check_output(
+                [
+                    shutil.which("pyang"), "--plugindir", PLUGIN_DIR,
+                    "-f", "pybind-dataclass", "-p", TEST_PATH,
+                    "--dataclass-serde", "--dataclass-dedup-classes",
+                    "--dataclass-split-dir", os.path.join(tmp, "dc_dedup"),
+                    self.YANG,
+                ],
+                stderr=subprocess.PIPE,
+                env={"PYTHONPATH": BASE_DIR},
+            )
+            sys.path.insert(0, tmp)
+            pkg = importlib.import_module("dc_dedup")
+            root = pkg.DataclassDedup
+            self.assertIs(root.A.Inner, root.B.Inner)
+            tree = pkg.from_ietf_json(root, {"dataclass-dedup:a": {"inner": {"port": 1}}})
+            self.assertEqual(tree.a.inner.port, 1)
+        finally:
+            sys.path.remove(tmp)
+            for name in [n for n in sys.modules if n.split(".")[0] == "dc_dedup"]:
+                del sys.modules[name]
+            shutil.rmtree(tmp)
+
+
 if __name__ == "__main__":
     unittest.main()
