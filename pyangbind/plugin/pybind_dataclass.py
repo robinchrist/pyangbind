@@ -216,6 +216,15 @@ Multi-file output (opt-in with ``--dataclass-split-dir DIR``)
     ``pyangbind.lib`` runtime dependency; this backend stays generated
     and stdlib-only.)
 
+    With ``--dataclass-split-augments`` the files follow the module that
+    contributes each node instead: every container/list class is emitted
+    at module level into the file of its node's module, and a file imports
+    by name the classes it uses from others. Schemas that hang all their
+    data below one root container by augment (Junos: ``junos-conf-root``
+    and some 50 augmenting ``junos-conf-*`` modules) otherwise get one
+    file. Dedup (``--dataclass-dedup-classes``) then shares classes only
+    within a module.
+
 Origin comments (opt-in with ``--dataclass-origin-comments``)
     Augment-heavy schemas (FRR's, for one) make it genuinely hard to see
     where a generated node comes from. With this flag, every class/field
@@ -2865,6 +2874,19 @@ class PybindDataclassPlugin(plugin.PyangPlugin):
             "exposes the same names as a single-file build",
         )
         group.add_option(
+            "--dataclass-split-augments",
+            dest="dataclass_split_augments",
+            action="store_true",
+            default=False,
+            help="With --dataclass-split-dir: one file per YANG module that "
+            "contributes data nodes, augments included, instead of per "
+            "module that defines top-level data nodes. Container/list "
+            "classes are emitted at module level (as with "
+            "--dataclass-dedup-classes) in the file of their node's "
+            "module. For schemas that hang everything below one root "
+            "container by augment (Junos), which otherwise land in one file",
+        )
+        group.add_option(
             "--no-dataclass-must-when",
             dest="no_dataclass_must_when",
             action="store_true",
@@ -2940,6 +2962,7 @@ class PybindDataclassPlugin(plugin.PyangPlugin):
             ),
             native_type_hints=getattr(ctx.opts, "dataclass_native_types", None),
             dedup_classes=getattr(ctx.opts, "dataclass_dedup_classes", False),
+            split_augments=getattr(ctx.opts, "dataclass_split_augments", False),
         )
 
 
@@ -3234,6 +3257,14 @@ class _Emitter:
         self.dedup_classes = dedup_classes
         self.shared_class_lines = []
         self.shared_class_by_body = {}
+        # --dataclass-split-augments: every tree class is a module-level
+        # block owned by the module of its node; blocks are appended when
+        # complete, so a block's children always precede it
+        self.split_augments = False
+        self.owner_modules = set()
+        self.blocks = []
+        self.block_stack = []
+        self.block_by_body = {}  # (owner, body) -> block, with dedup
 
     def _register_reusable(self, key, preferred_name, build_lines):
         """Register (once) a module-level reusable type. `key` dedups repeated
@@ -4402,6 +4433,45 @@ class _Emitter:
             self.shared_class_lines.extend(lines)
         return name
 
+    def emit_block_class(self, stmt, cname, fixed_name=False):
+        """--dataclass-split-augments: emit the class for `stmt` at module
+        level as a block owned by its node's module (falling back to the
+        enclosing block's owner for modules outside the compiled set), or
+        with dedup reuse an identical block of the same owner, and return
+        its module-level name. The enclosing block records the reference,
+        which becomes an import when the two land in different files."""
+        owner = self._module_name(stmt)
+        if owner not in self.owner_modules and self.block_stack:
+            owner = self.block_stack[-1]["owner"]
+        block = {"owner": owner, "refs": set()}
+        saved = self.lines
+        self.lines = []
+        self.block_stack.append(block)
+        try:
+            self.emit_node_class(stmt, cname, "")
+            lines = self.lines
+        finally:
+            self.lines = saved
+            self.block_stack.pop()
+        key = (owner, "\n".join(lines[2:]))
+        hit = self.block_by_body.get(key) if self.dedup_classes else None
+        if hit is not None:
+            name = hit["name"]
+        else:
+            name = cname
+            n = 1
+            while not fixed_name and name in self.reusable_names:
+                n += 1
+                name = "%s_%d" % (cname, n)
+            self.reusable_names.add(name)
+            lines[1] = lines[1].replace("class %s" % cname, "class %s" % name, 1)
+            block.update(name=name, lines=lines)
+            self.blocks.append(block)
+            self.block_by_body[key] = block
+        if self.block_stack:
+            self.block_stack[-1]["refs"].add(name)
+        return name
+
     def emit_node_class(self, stmt, cname, indent):
         """Emit a dataclass for a container / list entry / module."""
         self.lines.append("%s@dataclasses.dataclass" % indent)
@@ -4447,7 +4517,10 @@ class _Emitter:
                 while child_cname in used_class_names:
                     child_cname += "_"
                 used_class_names.add(child_cname)
-                if self.dedup_classes:
+                if self.split_augments:
+                    shared = self.emit_block_class(child, child_cname)
+                    self.lines.append("%s%s = %s" % (body_indent, child_cname, shared))
+                elif self.dedup_classes:
                     shared = self.emit_shared_class(child, child_cname)
                     self.lines.append("%s%s = %s" % (body_indent, child_cname, shared))
                 else:
@@ -4546,7 +4619,10 @@ def build_dataclasses(
     with_origin_comments=False, with_serde=False, with_xpaths=False,
     split_dir=None, with_must_when=True, with_annotations=True,
     with_native_ip_types=True, native_type_hints=None, dedup_classes=False,
+    split_augments=False,
 ):
+    if split_augments and split_dir is None:
+        raise ValueError("--dataclass-split-augments needs --dataclass-split-dir")
     identity_values, identity_canonical, identity_bases = _build_identity_values(ctx)
 
     emitter = _Emitter(
@@ -4573,8 +4649,15 @@ def build_dataclasses(
             )
         emitter.lines.append("})")
         emitter.lines.append("")
+    # lines emitted so far (the identity bases) belong to the runtime
+    prelude = list(emitter.lines)
     segments = []  # (module, its slice of emitter.lines), for split mode
-    for module in data_modules:
+    if split_augments:
+        emitter.split_augments = True
+        emitter.owner_modules = {emitter._module_name(m) for m in modules}
+        for module in data_modules:
+            emitter.emit_block_class(module, class_name(module.arg), fixed_name=True)
+    for module in data_modules if not split_augments else ():
         start = len(emitter.lines)
         emitter.shared_class_lines = []
         emitter.shared_class_by_body = {}
@@ -4597,8 +4680,17 @@ def build_dataclasses(
     ]
 
     if split_dir is not None:
+        if split_augments:
+            files, module_classes = _augment_files(emitter, data_modules)
+        else:
+            files = [
+                (safe_name(m.arg), [m.arg], lines, []) for m, lines in segments
+            ]
+            module_classes = [
+                (class_name(m.arg), safe_name(m.arg)) for m in data_modules
+            ]
         _write_split_package(
-            emitter, doc, data_modules, segments, split_dir,
+            emitter, doc, files, module_classes, prelude, split_dir,
             with_validation, with_serde, with_xpaths,
         )
         fd.write("# multi-file bindings package written to %s\n" % split_dir)
@@ -4644,11 +4736,68 @@ def build_dataclasses(
         fd.write("\n")
 
 
+def _augment_files(emitter, data_modules):
+    """--dataclass-split-augments: group the emitted blocks into files, one
+    per owning module, and return ([(stem, module names, lines, import
+    lines)], [(module class name, its file stem)]). Modules whose blocks reference each other
+    in a cycle (A augments into B and B into A) share one file, so the
+    imports between files form no cycle. Within a file blocks keep their
+    emission order, in which every block follows the blocks it references."""
+    owner_of = {b["name"]: b["owner"] for b in emitter.blocks}
+    edges = {}
+    for b in emitter.blocks:
+        out = edges.setdefault(b["owner"], set())
+        out.update(owner_of[r] for r in b["refs"] if owner_of[r] != b["owner"])
+
+    def reach(start):
+        seen, todo = set(), [start]
+        while todo:
+            for nxt in edges.get(todo.pop(), ()):
+                if nxt not in seen:
+                    seen.add(nxt)
+                    todo.append(nxt)
+        return seen
+
+    reachable = {o: reach(o) for o in edges}
+    data_names = [emitter._module_name(m) for m in data_modules]
+    group_of = {}
+    for owner in edges:
+        members = sorted(
+            {owner} | {o for o in reachable[owner] if owner in reachable[o]}
+        )
+        lead = next((d for d in data_names if d in members), members[0])
+        group_of[owner] = (safe_name(lead), members)
+
+    files = {}  # stem -> (module names, lines, {stem: names it imports})
+    for b in emitter.blocks:
+        stem, members = group_of[b["owner"]]
+        _, lines, imports = files.setdefault(stem, (members, [], {}))
+        lines.extend(b["lines"])
+        for r in b["refs"]:
+            other = group_of[owner_of[r]][0]
+            if other != stem:
+                imports.setdefault(other, set()).add(r)
+    out = []
+    for stem, (members, lines, imports) in files.items():
+        import_lines = []
+        for other in sorted(imports):
+            import_lines.append("from .%s import (" % other)
+            import_lines.extend("    %s," % n for n in sorted(imports[other]))
+            import_lines.append(")")
+        out.append((stem, members, lines, import_lines))
+    module_classes = [
+        (class_name(m.arg), group_of[emitter._module_name(m)][0])
+        for m in data_modules
+    ]
+    return out, module_classes
+
+
 def _write_split_package(
-    emitter, doc, data_modules, segments, split_dir,
+    emitter, doc, files, module_classes, prelude, split_dir,
     with_validation, with_serde, with_xpaths,
 ):
-    """Write the bindings as a Python package, one file per data module.
+    """Write the bindings as a Python package, one file per data module
+    (with --dataclass-split-augments: per module contributing data nodes).
 
     Everything shared lives exactly once: the embedded runtime (metadata
     dataclass, validation, serde, xpaths) in ``_runtime.py`` and every
@@ -4697,7 +4846,7 @@ def _write_split_package(
             header.append("import decimal")
         if with_serde or "ipaddress" in emitter.native_imports:
             header.append("import ipaddress")
-        write("_runtime.py", header + runtime_blocks + [""])
+        write("_runtime.py", header + runtime_blocks + [""] + prelude)
 
     # Names generated code may reference from _runtime, private + public.
     runtime_private = (
@@ -4736,17 +4885,17 @@ def _write_split_package(
         ]
         write("_types.py", header + types_lines)
 
-    module_files = {}  # module file stem -> root class name
-    for module, lines in segments:
-        stem = safe_name(module.arg)
-        if stem in module_files:
+    stems = {}  # file stem -> YANG module names
+    for stem, names, lines, import_lines in files:
+        if stem in stems:
             raise ValueError(
                 "YANG modules %r map to the same Python file name %s.py"
-                % (sorted(m.arg for m, _ in segments if safe_name(m.arg) == stem), stem)
+                % (sorted(stems[stem] + names), stem)
             )
-        module_files[stem] = class_name(module.arg)
+        stems[stem] = names
         header = [
-            '"""Typed dataclass bindings for YANG module `%s`."""' % module.arg,
+            '"""Typed dataclass bindings for YANG module%s %s."""'
+            % ("s" if len(names) > 1 else "", ", ".join("`%s`" % n for n in names)),
             "",
             "from __future__ import annotations",
             "",
@@ -4766,6 +4915,7 @@ def _write_split_package(
             header.append("from ._runtime import %s" % ", ".join(from_runtime))
         if reusable_names:
             header.append("from ._types import *  # noqa: F401,F403")
+        header += import_lines
         header += ["", ""]
         write("%s.py" % stem, header + lines)
 
@@ -4778,10 +4928,10 @@ def _write_split_package(
         # Also executes the RFC 7952 annotation-registry population.
         init.append("from ._types import *  # noqa: F401,F403")
         exported += reusable_names
-    for stem, cname in module_files.items():
+    for cname, stem in module_classes:
         init.append("from .%s import %s" % (stem, cname))
         exported.append(cname)
-    if not data_modules:
+    if not module_classes:
         init.append("# (none of the input modules define config data nodes)")
     if exported:
         init += [

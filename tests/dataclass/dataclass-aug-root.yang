@@ -1,0 +1,15 @@
+module dataclass-aug-root {
+  yang-version 1.1;
+  namespace "urn:dataclass-aug-root";
+  prefix dar;
+
+  identity kind;
+  identity kind-a {
+    base kind;
+  }
+
+  container root {
+    leaf name { type string; }
+    leaf kind { type identityref { base kind; } }
+  }
+}

@@ -1,0 +1,30 @@
+module dataclass-aug-b {
+  yang-version 1.1;
+  namespace "urn:dataclass-aug-b";
+  prefix dab;
+
+  import dataclass-aug-root { prefix dar; }
+  import dataclass-aug-a { prefix daa; }
+
+  grouping common {
+    container opts {
+      leaf v { type uint8 { range "1..10"; } }
+    }
+  }
+
+  augment "/dar:root/daa:alpha" {
+    container beta {
+      leaf z { type string; }
+    }
+  }
+  augment "/dar:root" {
+    list item {
+      key id;
+      leaf id { type string; }
+      uses common;
+    }
+    container gamma {
+      uses common;
+    }
+  }
+}

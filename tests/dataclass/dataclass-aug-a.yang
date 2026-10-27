@@ -1,0 +1,13 @@
+module dataclass-aug-a {
+  yang-version 1.1;
+  namespace "urn:dataclass-aug-a";
+  prefix daa;
+
+  import dataclass-aug-root { prefix dar; }
+
+  augment "/dar:root" {
+    container alpha {
+      leaf x { type int8; }
+    }
+  }
+}

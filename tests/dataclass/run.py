@@ -1759,5 +1759,95 @@ class DataclassDedupClassesTests(unittest.TestCase):
             shutil.rmtree(tmp)
 
 
+class DataclassSplitAugmentsTests(unittest.TestCase):
+    """--dataclass-split-augments: one file per module contributing data
+    nodes, so a schema that augments everything below one root container
+    is still split."""
+
+    YANGS = [
+        os.path.join(TEST_PATH, "dataclass-aug-%s.yang" % m)
+        for m in ("root", "a", "b")
+    ]
+
+    def build(self, *flags):
+        import importlib
+        import tempfile
+
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        pkg = "dc_aug_%d" % len(flags)
+        subprocess.check_output(
+            [
+                shutil.which("pyang"), "--plugindir", PLUGIN_DIR,
+                "-f", "pybind-dataclass", "-p", TEST_PATH, "--dataclass-serde",
+                "--dataclass-split-dir", os.path.join(tmp, pkg),
+                "--dataclass-split-augments", *flags, *self.YANGS,
+            ],
+            stderr=subprocess.PIPE,
+            env={"PYTHONPATH": BASE_DIR},
+        )
+        sys.path.insert(0, tmp)
+        self.addCleanup(sys.path.remove, tmp)
+        self.addCleanup(
+            lambda: [sys.modules.pop(n) for n in list(sys.modules) if n.split(".")[0] == pkg]
+        )
+        sources = {}
+        for filename in os.listdir(os.path.join(tmp, pkg)):
+            if filename.endswith(".py"):
+                with open(os.path.join(tmp, pkg, filename)) as fd:
+                    sources[filename] = fd.read()
+        return importlib.import_module(pkg), sources
+
+    def test_classes_go_to_the_file_of_their_module(self):
+        pkg, sources = self.build("--dataclass-dedup-classes")
+        self.assertEqual(
+            sorted(sources),
+            ["__init__.py", "_runtime.py", "_types.py", "dataclass_aug_a.py",
+             "dataclass_aug_b.py", "dataclass_aug_root.py"],
+        )
+        self.assertIn("class Root(", sources["dataclass_aug_root.py"])
+        self.assertIn("class Alpha(", sources["dataclass_aug_a.py"])
+        # b augments into a's tree: a imports b's class
+        self.assertIn("class Beta(", sources["dataclass_aug_b.py"])
+        self.assertIn("from .dataclass_aug_b import (\n    Beta,\n)", sources["dataclass_aug_a.py"])
+        self.assertNotIn("from .dataclass_aug", sources["dataclass_aug_b.py"])
+        root = pkg.DataclassAugRoot.Root
+        self.assertIs(root.Item.Opts, root.Gamma.Opts)  # dedup within b
+
+    def test_identity_bases_reach_the_runtime(self):
+        _, sources = self.build()
+        self.assertIn("_YANG_IDENTITY_BASES.update({", sources["_runtime.py"])
+
+    def test_bindings_work_end_to_end(self):
+        for flags in ((), ("--dataclass-dedup-classes",)):
+            pkg, _ = self.build(*flags)
+            data = {
+                "dataclass-aug-root:root": {
+                    "name": "r",
+                    "kind": "dataclass-aug-root:kind-a",
+                    "dataclass-aug-a:alpha": {"x": 1, "dataclass-aug-b:beta": {"z": "z"}},
+                    "dataclass-aug-b:item": [{"id": "i", "opts": {"v": 2}}],
+                    "dataclass-aug-b:gamma": {"opts": {"v": 3}},
+                }
+            }
+            tree = pkg.from_ietf_json(pkg.DataclassAugRoot, data)
+            pkg.validate_tree(tree)
+            self.assertEqual(pkg.to_ietf_json(tree), data)
+            with self.assertRaises(pkg.YangValidationError):
+                tree.root.gamma.opts.v = 11
+
+    def test_needs_split_dir(self):
+        proc = subprocess.run(
+            [
+                shutil.which("pyang"), "--plugindir", PLUGIN_DIR,
+                "-f", "pybind-dataclass", "-p", TEST_PATH,
+                "--dataclass-split-augments", self.YANGS[0],
+            ],
+            capture_output=True, text=True, env={"PYTHONPATH": BASE_DIR},
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("--dataclass-split-dir", proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
