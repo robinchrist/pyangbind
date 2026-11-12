@@ -235,6 +235,13 @@ Multi-file output (opt-in with ``--dataclass-split-dir DIR``)
     only theirs (``validate_tree`` creates every container and so loads
     them all).
 
+    Every file but ``_runtime.py`` gets a ``.pyi`` type stub beside it
+    (disable with ``--no-dataclass-stubs``): annotations, class aliases and
+    method signatures, without method bodies or schema metadata. Pyright
+    stops code-flow analysis of a module's top level above a fixed,
+    unconfigurable complexity, and the large files of a big schema exceed
+    it (their class-body aliases turn Unknown); stubs are read without
+    code flow. Single-file output gets no stub.
 
 Origin comments (opt-in with ``--dataclass-origin-comments``)
     Augment-heavy schemas (FRR's, for one) make it genuinely hard to see
@@ -1771,7 +1778,9 @@ class _YangNode:
     container on first access (__init__ leaves containers unset, so
     building a node does not build, or import, the whole tree below)."""
 
-    _yang_fields: typing.ClassVar[dict] = {}
+    _yang_fields: typing.ClassVar[dict[str, _FieldMeta]] = {}
+    _yang_name: typing.ClassVar[str]
+    _yang_module: typing.ClassVar[str]
 
     if not typing.TYPE_CHECKING:
 
@@ -2994,6 +3003,16 @@ class PybindDataclassPlugin(plugin.PyangPlugin):
             "container by augment (Junos), which otherwise land in one file",
         )
         group.add_option(
+            "--no-dataclass-stubs",
+            dest="no_dataclass_stubs",
+            action="store_true",
+            default=False,
+            help="With --dataclass-split-dir: do not write a .pyi type stub "
+            "beside each file. The stubs keep large modules typed in "
+            "Pyright, which skips code-flow analysis of a module top level "
+            "above a fixed complexity",
+        )
+        group.add_option(
             "--no-dataclass-must-when",
             dest="no_dataclass_must_when",
             action="store_true",
@@ -3070,6 +3089,7 @@ class PybindDataclassPlugin(plugin.PyangPlugin):
             native_type_hints=getattr(ctx.opts, "dataclass_native_types", None),
             dedup_classes=getattr(ctx.opts, "dataclass_dedup_classes", False),
             split_augments=getattr(ctx.opts, "dataclass_split_augments", False),
+            with_stubs=not getattr(ctx.opts, "no_dataclass_stubs", False),
         )
 
 
@@ -3091,10 +3111,22 @@ def class_name(yang_name):
     return name
 
 
+# Emitted lines are str; these subclasses mark lines that belong to only
+# one of the two outputs of a class, the module (.py) and its type stub
+# (.pyi). The lines of a class travel as one list (dedup, blocks, split
+# files) and each writer filters them (_py_lines / _stub_lines).
+class _PyOnly(str):
+    """A line of the .py only (method bodies, schema metadata)."""
+
+
+class _StubOnly(str):
+    """A line of the .pyi only (method signatures)."""
+
+
 class _Alias(str):
     """A class-body alias `Name = Target` of a module-level class. In a
     split package the .py turns it into a lazy reference when Target is
-    defined in another file (see _py_lines)."""
+    defined in another file (see _py_lines); the stub keeps it."""
 
     indent: str
     name: str
@@ -3117,21 +3149,43 @@ def _factory_call(factory):
 
 
 def _py_lines(lines, lazy=()):
-    """`lines` with the aliases of a name in `lazy` reading it from the
-    file's _LAZY table instead of a module global."""
+    """The .py lines of `lines`; aliases of a name in `lazy` read it from
+    the file's _LAZY table instead of a module global."""
     out = []
     for line in lines:
+        if isinstance(line, _StubOnly):
+            continue
         if isinstance(line, _Alias) and line.target in lazy:
             line = "%s%s = _LAZY[%r]" % (line.indent, line.name, line.target)
         out.append(line)
     return out
 
 
-def _class_methods(fields, indent):
+def _stub_lines(lines):
+    """The .pyi lines of `lines`. A stub is read without code flow, so to
+    Pyright a class-body alias `Name = Name` refers to itself (Unknown);
+    such aliases read a module-level `_cls_Name = Name`, appended."""
+    out = []
+    targets = []
+    for line in lines:
+        if isinstance(line, _PyOnly):
+            continue
+        if isinstance(line, _Alias) and line.name == line.target:
+            if line.target not in targets:
+                targets.append(line.target)
+            line = "%s%s = _cls_%s" % (line.indent, line.name, line.target)
+        out.append(line)
+    if targets:
+        out.append("")
+        out.extend("_cls_%s = %s" % (t, t) for t in targets)
+    return out
+
+
+def _class_methods(fields, indent, with_meta_decls=()):
     """Lines of the methods of a generated class (what @dataclass used to
     generate at import time; written out, they are compiled into the .pyc
     once instead): __init__ with one parameter per field in field order,
-    __eq__ and __repr__. `fields` holds
+    __eq__ and __repr__, plus the stub signatures. `fields` holds
     (name, type text, init kind, expr) tuples:
 
     - "value": the parameter defaults to `expr` (None or an immutable YANG
@@ -3140,7 +3194,10 @@ def _class_methods(fields, indent):
       (a list, a bits instance)
     - "child": a container built eagerly, `expr` naming its class attribute
     - "lazy": a container; left unset unless given (_YangNode.__getattr__
-      creates it on first access)"""
+      creates it on first access)
+
+    `with_meta_decls` are stub-only ClassVar declarations for a class
+    without the _YangNode base, which declares them otherwise."""
     names = {f[0] for f in fields}
     me = "self"
     while me in names:
@@ -3149,46 +3206,54 @@ def _class_methods(fields, indent):
     while other in names:
         other = "_" + other
     inner = indent + "    "
-    out = []
+    out: list[str] = [_StubOnly(indent + decl) for decl in with_meta_decls]
     params = "".join(
         ", %s=%s" % (name, expr if kind == "value" else "None")
         for name, _t, kind, expr in fields
     )
-    out.append("%sdef __init__(%s%s):" % (indent, me, params))
+    out.append(_PyOnly("%sdef __init__(%s%s):" % (indent, me, params)))
     for name, _t, kind, expr in fields:
         if kind == "value":
-            out.append("%s%s.%s = %s" % (inner, me, name, name))
+            out.append(_PyOnly("%s%s.%s = %s" % (inner, me, name, name)))
         elif kind in ("new", "child"):
             if kind == "child":
                 expr = "%s.%s()" % (me, expr)
-            out.append(
+            out.append(_PyOnly(
                 "%s%s.%s = %s if %s is None else %s" % (inner, me, name, expr, name, name)
-            )
+            ))
         else:
-            out.append("%sif %s is not None:" % (inner, name))
-            out.append("%s    %s.%s = %s" % (inner, me, name, name))
+            out.append(_PyOnly("%sif %s is not None:" % (inner, name)))
+            out.append(_PyOnly("%s    %s.%s = %s" % (inner, me, name, name)))
     if not fields:
-        out.append("%spass" % inner)
-    out.append("")
-    out.append("%sdef __eq__(%s, %s):" % (indent, me, other))
-    out.append("%sif %s.__class__ is not %s.__class__:" % (inner, other, me))
-    out.append("%s    return NotImplemented" % inner)
+        out.append(_PyOnly("%spass" % inner))
+    out.append(_PyOnly(""))
+    out.append(_PyOnly("%sdef __eq__(%s, %s):" % (indent, me, other)))
+    out.append(_PyOnly("%sif %s.__class__ is not %s.__class__:" % (inner, other, me)))
+    out.append(_PyOnly("%s    return NotImplemented" % inner))
     if fields:
-        out.append("%sreturn (%s) == (%s)" % (
+        out.append(_PyOnly("%sreturn (%s) == (%s)" % (
             inner,
             "".join("%s.%s, " % (me, f[0]) for f in fields).rstrip(),
             "".join("%s.%s, " % (other, f[0]) for f in fields).rstrip(),
-        ))
+        )))
     else:
-        out.append("%sreturn True" % inner)
-    out.append("")
-    out.append("%sdef __repr__(%s):" % (indent, me))
-    out.append("%sreturn '%%s(%s)' %% (%s.__class__.__qualname__%s)" % (
+        out.append(_PyOnly("%sreturn True" % inner))
+    out.append(_PyOnly(""))
+    out.append(_PyOnly("%sdef __repr__(%s):" % (indent, me)))
+    out.append(_PyOnly("%sreturn '%%s(%s)' %% (%s.__class__.__qualname__%s)" % (
         inner,
         ", ".join("%s=%%r" % f[0] for f in fields),
         me,
         "".join(", %s.%s" % (me, f[0]) for f in fields),
+    )))
+    stub_params = "".join(
+        ", %s: %s = ..." % (name, type_text) for name, type_text, _k, _e in fields
+    )
+    out.append(_StubOnly(
+        "%sdef __init__(%s%s) -> None: ..." % (indent, me, stub_params)
     ))
+    out.append(_StubOnly("%sdef __eq__(%s, %s: object) -> bool: ..." % (indent, me, other)))
+    out.append(_StubOnly("%sdef __repr__(%s) -> str: ..." % (indent, me)))
     return out
 
 
@@ -4546,24 +4611,26 @@ class _Emitter:
             ]
             out.extend("    %s: bool" % bit_fname for bit_fname, _ in bits)
             if self.with_meta:
-                out.append("")
-                out.append("    _yang_name = %r" % label)
-                out.append("    _yang_module = %r" % bits_module)
-                out.append("    _yang_fields = {")
+                out.append(_PyOnly(""))
+                out.append(_PyOnly("    _yang_name = %r" % label))
+                out.append(_PyOnly("    _yang_module = %r" % bits_module))
+                out.append(_PyOnly("    _yang_fields = {"))
                 check = ", check=_Check('bool')" if self.with_validation else ""
                 out.extend(
-                    "        %r: _FieldMeta(%r, %r, 'bit'%s),"
-                    % (bit_fname, bit_yang, bits_module, check)
+                    _PyOnly("        %r: _FieldMeta(%r, %r, 'bit'%s),"
+                            % (bit_fname, bit_yang, bits_module, check))
                     for bit_fname, bit_yang in bits
                 )
-                out.append("    }")
+                out.append(_PyOnly("    }"))
             out.append("")
             out.extend(_class_methods(
-                [(bit_fname, "bool", "value", "False") for bit_fname, _ in bits], "    "
+                [(bit_fname, "bool", "value", "False") for bit_fname, _ in bits],
+                "    ", self._meta_decls(),
             ))
-            out.append("")
-            out.append("    def __bool__(self) -> bool:")
-            out.append("        return any(vars(self).values())")
+            out.append(_PyOnly(""))
+            out.append(_PyOnly("    def __bool__(self):"))
+            out.append(_PyOnly("        return any(vars(self).values())"))
+            out.append(_StubOnly("    def __bool__(self) -> bool: ..."))
             return out
 
         # id(resolved_type) dedups across leaves sharing a typedef (they
@@ -4588,6 +4655,17 @@ class _Emitter:
             return cname
         kwargs = ", ".join("%s=True" % safe_name(b) for b in default_stmt.arg.split())
         return "lambda: %s(%s)" % (cname, kwargs)
+
+    def _meta_decls(self):
+        """Stub-only ClassVar declarations of the schema metadata, for a
+        class without the _YangNode base (which declares them)."""
+        if not self.with_meta or self.with_validation:
+            return ()
+        return (
+            "_yang_name: typing.ClassVar[str]",
+            "_yang_module: typing.ClassVar[str]",
+            "_yang_fields: typing.ClassVar[dict[str, _FieldMeta]]",
+        )
 
     def _emit_leaf(self, child, fname, indent):
         """Emit the annotation of a leaf / leaf-list field and return its
@@ -4777,25 +4855,29 @@ class _Emitter:
                 )
 
         if self.with_meta:
-            self.lines.append("")
-            self.lines.append("%s_yang_name = %r" % (body_indent, stmt.arg))
-            self.lines.append("%s_yang_module = %r" % (body_indent, self._module_name(stmt)))
+            self.lines.append(_PyOnly(""))
+            self.lines.append(_PyOnly("%s_yang_name = %r" % (body_indent, stmt.arg)))
+            self.lines.append(
+                _PyOnly("%s_yang_module = %r" % (body_indent, self._module_name(stmt)))
+            )
             if self.with_xpaths:
                 if stmt.keyword in ("module", "submodule"):
                     schema_path = "/"
                 else:
                     schema_path, _ = self._abs_data_path(stmt)
-                self.lines.append("%s_yang_schema_path = %r" % (body_indent, schema_path))
+                self.lines.append(
+                    _PyOnly("%s_yang_schema_path = %r" % (body_indent, schema_path))
+                )
             if choices:
-                self.lines.append("%s_yang_choices = %r" % (body_indent, choices))
+                self.lines.append(_PyOnly("%s_yang_choices = %r" % (body_indent, choices)))
             if field_metas:
-                self.lines.append("%s_yang_fields = {" % body_indent)
+                self.lines.append(_PyOnly("%s_yang_fields = {" % body_indent))
                 for fname, meta in field_metas:
-                    self.lines.append("%s    %r: %s," % (body_indent, fname, meta))
-                self.lines.append("%s}" % body_indent)
+                    self.lines.append(_PyOnly("%s    %r: %s," % (body_indent, fname, meta)))
+                self.lines.append(_PyOnly("%s}" % body_indent))
 
-        self.lines.append("")
-        self.lines.extend(_class_methods(fields, body_indent))
+        self.lines.append(_PyOnly(""))
+        self.lines.extend(_class_methods(fields, body_indent, self._meta_decls()))
         self.lines.append("")
 
 
@@ -4822,7 +4904,7 @@ def build_dataclasses(
     with_origin_comments=False, with_serde=False, with_xpaths=False,
     split_dir=None, with_must_when=True, with_annotations=True,
     with_native_ip_types=True, native_type_hints=None, dedup_classes=False,
-    split_augments=False,
+    split_augments=False, with_stubs=True,
 ):
     if split_augments and split_dir is None:
         raise ValueError("--dataclass-split-augments needs --dataclass-split-dir")
@@ -4894,7 +4976,7 @@ def build_dataclasses(
             ]
         _write_split_package(
             emitter, doc, files, module_classes, prelude, split_dir,
-            with_validation, with_serde, with_xpaths,
+            with_validation, with_serde, with_xpaths, with_stubs,
         )
         fd.write("# multi-file bindings package written to %s\n" % split_dir)
         return
@@ -4996,7 +5078,7 @@ def _augment_files(emitter, data_modules):
 
 def _write_split_package(
     emitter, doc, files, module_classes, prelude, split_dir,
-    with_validation, with_serde, with_xpaths,
+    with_validation, with_serde, with_xpaths, with_stubs=True,
 ):
     """Write the bindings as a Python package, one file per data module
     (with --dataclass-split-augments: per module contributing data nodes).
@@ -5016,7 +5098,15 @@ def _write_split_package(
     ``_LAZY`` table and imports it on first use, through the class-body
     alias, the field's _FieldMeta.cls or the module ``__getattr__``. So
     ``import <package>`` imports only the files holding the module
-    classes, and a tree built for a few hierarchies imports only theirs."""
+    classes, and a tree built for a few hierarchies imports only theirs.
+
+    With `with_stubs`, every file but ``_runtime.py`` gets a ``.pyi``
+    stub beside it: annotations, aliases and method signatures, without
+    method bodies or schema metadata, and with plain imports. Type
+    checkers read the stub instead of the module; Pyright gives up
+    code-flow analysis of a module's top level above a fixed complexity,
+    which large binding modules exceed (their class-body aliases then
+    turn Unknown)."""
 
     def needed(lines, names):
         return [n for n in names if any(n in line for line in lines)]
@@ -5027,6 +5117,11 @@ def _write_split_package(
             out.write("\n".join(lines))
             if not lines or lines[-1] != "":
                 out.write("\n")
+
+    def write_both(stem, py, stub):
+        write("%s.py" % stem, py)
+        if with_stubs:
+            write("%s.pyi" % stem, stub)
 
     os.makedirs(split_dir, exist_ok=True)
     lazy_imports = emitter.with_meta  # _LazyClass is part of the runtime
@@ -5103,11 +5198,14 @@ def _write_split_package(
             "]",
             "",
         ]
-        header = doc_lines + imports_of(types_lines)
-        from_runtime = needed(types_lines, runtime_private)
-        if from_runtime:
-            header.append("from ._runtime import %s" % ", ".join(from_runtime))
-        write("_types.py", header + all_lines + types_lines)
+        out = {}
+        for kind, lines in (("py", _py_lines(types_lines)), ("pyi", _stub_lines(types_lines))):
+            header = doc_lines + imports_of(lines)
+            from_runtime = needed(lines, runtime_private)
+            if from_runtime:
+                header.append("from ._runtime import %s" % ", ".join(from_runtime))
+            out[kind] = header + all_lines + lines
+        write_both("_types", out["py"], out["pyi"])
 
     stems = {}  # file stem -> YANG module names
     for stem, names, lines, imports in files:
@@ -5127,6 +5225,7 @@ def _write_split_package(
         imported = {n: other for other in imports for n in imports[other]}
         lazy = imported if lazy_imports else {}
         py = _py_lines(lines, lazy)
+        stub = _stub_lines(lines)
 
         header = doc_lines + imports_of(py)
         from_runtime = needed(py + (["_LazyClass"] if lazy else []), runtime_private)
@@ -5161,7 +5260,18 @@ def _write_split_package(
                 header.append(")")
         header += ["", ""]
 
-        write("%s.py" % stem, header + py)
+        stub_header = doc_lines + imports_of(stub)
+        from_runtime = needed(stub, runtime_private)
+        if from_runtime:
+            stub_header.append("from ._runtime import %s" % ", ".join(from_runtime))
+        if reusable_names:
+            stub_header.append("from ._types import *  # noqa: F401,F403")
+        for other in sorted(imports):
+            stub_header.append("from .%s import (" % other)
+            stub_header.extend("    %s as %s," % (n, n) for n in sorted(imports[other]))
+            stub_header.append(")")
+        stub_header += ["", ""]
+        write_both(stem, header + py, stub_header + stub)
 
     init = doc + [""]
     exported = []
@@ -5184,4 +5294,4 @@ def _write_split_package(
             *("    %r," % n for n in exported),
             "]",
         ]
-    write("__init__.py", init)
+    write_both("__init__", init, init)

@@ -1826,25 +1826,29 @@ class DataclassSplitAugmentsTests(unittest.TestCase):
         )
         sources = {}
         for filename in os.listdir(os.path.join(tmp, pkg)):
-            if filename.endswith(".py"):
+            if filename.endswith((".py", ".pyi")):
                 with open(os.path.join(tmp, pkg, filename)) as fd:
                     sources[filename] = fd.read()
         return importlib.import_module(pkg), sources
 
     def test_classes_go_to_the_file_of_their_module(self):
         pkg, sources = self.build("--dataclass-dedup-classes")
+        stems = ["__init__", "_types", "dataclass_aug_a", "dataclass_aug_b", "dataclass_aug_root"]
         self.assertEqual(
             sorted(sources),
-            ["__init__.py", "_runtime.py", "_types.py", "dataclass_aug_a.py",
-             "dataclass_aug_b.py", "dataclass_aug_root.py"],
+            sorted(["_runtime.py"] + [s + ext for s in stems for ext in (".py", ".pyi")]),
         )
         self.assertIn("class Root(", sources["dataclass_aug_root.py"])
         self.assertIn("class Alpha(", sources["dataclass_aug_a.py"])
-        # b augments into a's tree: a refers to b's class, imported lazily
+        # b augments into a's tree: a refers to b's class, lazily in the
+        # module, by a plain import in the stub
         self.assertIn("class Beta(", sources["dataclass_aug_b.py"])
         self.assertIn("'Beta': _LazyClass('.dataclass_aug_b', 'Beta'),", sources["dataclass_aug_a.py"])
         self.assertIn("    Beta = _LAZY['Beta']", sources["dataclass_aug_a.py"])
         self.assertNotIn("from .dataclass_aug_b", sources["dataclass_aug_a.py"])
+        self.assertIn("from .dataclass_aug_b import (\n    Beta as Beta,\n)", sources["dataclass_aug_a.pyi"])
+        self.assertIn("    Beta = _cls_Beta", sources["dataclass_aug_a.pyi"])
+        self.assertIn("\n_cls_Beta = Beta\n", sources["dataclass_aug_a.pyi"])
         self.assertNotIn("from .dataclass_aug", sources["dataclass_aug_b.py"])
         root = pkg.DataclassAugRoot.Root
         self.assertIs(root.Item.Opts, root.Gamma.Opts)  # dedup within b
@@ -1901,6 +1905,56 @@ class DataclassSplitAugmentsTests(unittest.TestCase):
         self.assertTrue(loaded("dataclass_aug_b"))
         with self.assertRaises(AttributeError):
             root_file.NoSuchClass
+
+    def test_stubs(self):
+        import ast
+
+        _, sources = self.build("--dataclass-dedup-classes")
+        for filename, text in sources.items():
+            if filename.endswith(".pyi"):
+                ast.parse(text, filename)
+                self.assertNotIn("_LAZY", text)
+                self.assertNotIn("_yang_fields =", text)
+        self.assertEqual(sources["__init__.pyi"], sources["__init__.py"])
+        stub = sources["dataclass_aug_root.pyi"]
+        self.assertIn("    name: str | None\n", stub)
+        self.assertIn("    Alpha = _cls_Alpha\n", stub)
+        self.assertIn("def __init__(self, name: str | None = ..., ", stub)
+        self.assertNotIn("self.name = name", stub)
+        self.assertNotIn(" = ...", sources["dataclass_aug_root.py"])
+
+    def test_no_stubs_flag(self):
+        _, sources = self.build("--no-dataclass-stubs")
+        self.assertFalse([f for f in sources if f.endswith(".pyi")])
+
+    @unittest.skipUnless(shutil.which("pyright"), "pyright not installed")
+    def test_pyright_reads_the_stubs(self):
+        import json
+
+        pkg, _ = self.build("--dataclass-dedup-classes")
+        tmp = os.path.dirname(pkg.__path__[0])
+        consumer = os.path.join(tmp, "consumer.py")
+        with open(consumer, "w") as fd:
+            fd.write(
+                "import %s as b\n"
+                "tree = b.DataclassAugRoot()\n"
+                "reveal_type(tree.root.alpha.beta)\n"
+                "reveal_type(b.DataclassAugRoot.Root.Item.Opts)\n"
+                "tree.root.alpha.x = 'one'\n"
+                "tree.root.item.append(b.DataclassAugRoot.Root.Item(id='i'))\n" % pkg.__name__
+            )
+        proc = subprocess.run(
+            [shutil.which("pyright"), "--outputjson", consumer],
+            capture_output=True, text=True, cwd=tmp,
+        )
+        diags = json.loads(proc.stdout)["generalDiagnostics"]
+        infos = [d["message"] for d in diags if d["severity"] == "information"]
+        errors = [(d["range"]["start"]["line"], d["message"]) for d in diags if d["severity"] == "error"]
+        self.assertEqual(
+            infos,
+            ['Type of "tree.root.alpha.beta" is "Beta"', 'Type of "b.DataclassAugRoot.Root.Item.Opts" is "type[Opts]"'],
+        )
+        self.assertEqual([line for line, _ in errors], [4], errors)
 
     def test_needs_split_dir(self):
         proc = subprocess.run(
