@@ -223,12 +223,18 @@ Multi-file output (opt-in with ``--dataclass-split-dir DIR``)
 
     With ``--dataclass-split-augments`` the files follow the module that
     contributes each node instead: every container/list class is emitted
-    at module level into the file of its node's module, and a file imports
-    by name the classes it uses from others. Schemas that hang all their
+    at module level into the file of its node's module, and a file refers
+    by name to the classes it uses from others. Schemas that hang all their
     data below one root container by augment (Junos: ``junos-conf-root``
     and some 50 augmenting ``junos-conf-*`` modules) otherwise get one
     file. Dedup (``--dataclass-dedup-classes``) then shares classes only
-    within a module.
+    within a module. With the schema metadata, a class of another file is
+    imported on first use (``_LazyClass``, the file's ``_LAZY`` table and
+    module ``__getattr__``), so ``import <package>`` loads only the files
+    of the module classes, and a tree touching a few hierarchies loads
+    only theirs (``validate_tree`` creates every container and so loads
+    them all).
+
 
 Origin comments (opt-in with ``--dataclass-origin-comments``)
     Augment-heavy schemas (FRR's, for one) make it genuinely hard to see
@@ -412,37 +418,119 @@ _XPATH_SUPPORTED_FUNCTIONS = frozenset(
 # metadata (validation today; serialisation and xpaths reuse the same
 # table). Stdlib-only, like everything embedded in the generated module.
 _META_RUNTIME = '''
-@dataclasses.dataclass(frozen=True)
+class _LazyClass:
+    """A tree class defined in another file of a split bindings package,
+    imported on first use. It stands in for the class in the class-body
+    alias (as a descriptor) and in the `cls` of its _FieldMeta, so
+    importing a file does not import every file it refers to."""
+
+    __slots__ = ("module", "name", "_cls")
+
+    def __init__(self, module, name):
+        self.module = module  # relative to this package, e.g. ".foo"
+        self.name = name
+        self._cls = None
+
+    def resolve(self):
+        cls = self._cls
+        if cls is None:
+            module = importlib.import_module(self.module, __package__)
+            cls = self._cls = getattr(module, self.name)
+        return cls
+
+    def __get__(self, obj, owner=None):
+        return self.resolve()
+
+    def __repr__(self):
+        return "<lazy %s%s.%s>" % (__package__, self.module, self.name)
+
+
 class _FieldMeta:
     """Schema metadata for one generated field (a leaf / leaf-list /
-    container / list, or one bool bit of a bits dataclass)."""
+    container / list, or one bool bit of a bits class). Immutable by
+    convention."""
 
-    yang_name: str
-    module: str  # module that contributed the node (RFC 7951 qualifier)
-    kind: str  # "leaf" | "leaf-list" | "container" | "list" | "bit"
-    cls: type | None = None  # nested/bits class of container/list/bits fields
-    check: typing.Any = None  # _Check, when validation is generated
-    encode: str | None = None  # IETF-JSON value encoding tag, when special
-    identity_map: typing.Any = None  # identityref spelling -> RFC 7951 canonical
-    mandatory: bool = False
-    presence: bool = False  # presence container
-    min_elements: int | None = None
-    max_elements: int | None = None
-    keys: tuple = ()  # list key field names
-    # list `unique` groups: each group is a tuple of leaf paths, each
-    # path a tuple of field-name steps (descendant containers + leaf)
-    unique: tuple = ()
-    leafref: str | None = None  # absolute schema path of the leafref target
-    # prefix-normalized leafref path expression, for the XPath engine's
-    # deref(); present whenever the path is inside the evaluated subset
-    leafref_expr: str | None = None
-    # chain of (choice, case) pairs a choice-flattened field came out
-    # of, outermost first; None for fields outside any choice
-    case: tuple | None = None
-    natives: tuple = ()  # native Python classes (native-type hints), for serde
+    # yang_name: the YANG node name
+    # module: module that contributed the node (RFC 7951 qualifier)
+    # kind: "leaf" | "leaf-list" | "container" | "list" | "bit"
+    # cls: nested/bits class of container/list/bits fields (a _LazyClass
+    #   until first use, when the class lives in another file)
+    # check: _Check, when validation is generated
+    # encode: IETF-JSON value encoding tag, when special
+    # identity_map: identityref spelling -> RFC 7951 canonical
+    # mandatory; presence (presence container); min_elements; max_elements
+    # keys: list key field names
+    # unique: list `unique` groups: each group is a tuple of leaf paths,
+    #   each path a tuple of field-name steps (descendant containers + leaf)
+    # leafref: absolute schema path of the leafref target
+    # leafref_expr: prefix-normalized leafref path expression, for the
+    #   XPath engine's deref(); present whenever the path is inside the
+    #   evaluated subset
+    # case: chain of (choice, case) pairs a choice-flattened field came
+    #   out of, outermost first; None for fields outside any choice
+    # natives: native Python classes (native-type hints), for serde
     # XPath constraints, evaluated by validate_tree where the node exists:
-    musts: tuple = ()  # ((expression, error-message | None), ...)
-    whens: tuple = ()  # ((expression, context-is-self), ...); False = parent
+    # musts: ((expression, error-message | None), ...)
+    # whens: ((expression, context-is-self), ...); False = parent
+    __slots__ = (
+        "yang_name", "module", "kind", "_cls", "check", "encode",
+        "identity_map", "mandatory", "presence", "min_elements",
+        "max_elements", "keys", "unique", "leafref", "leafref_expr", "case",
+        "natives", "musts", "whens",
+    )
+
+    def __init__(
+        self, yang_name, module, kind, cls=None, check=None, encode=None,
+        identity_map=None, mandatory=False, presence=False, min_elements=None,
+        max_elements=None, keys=(), unique=(), leafref=None, leafref_expr=None,
+        case=None, natives=(), musts=(), whens=(),
+    ):
+        self.yang_name = yang_name
+        self.module = module
+        self.kind = kind
+        self._cls = cls
+        self.check = check
+        self.encode = encode
+        self.identity_map = identity_map
+        self.mandatory = mandatory
+        self.presence = presence
+        self.min_elements = min_elements
+        self.max_elements = max_elements
+        self.keys = keys
+        self.unique = unique
+        self.leafref = leafref
+        self.leafref_expr = leafref_expr
+        self.case = case
+        self.natives = natives
+        self.musts = musts
+        self.whens = whens
+
+    @property
+    def cls(self):
+        cls = self._cls
+        if cls.__class__ is _LazyClass:
+            cls = self._cls = cls.resolve()
+        return cls
+
+    def _astuple(self):
+        return tuple(
+            self.cls if name == "_cls" else getattr(self, name)
+            for name in self.__slots__
+        )
+
+    def __eq__(self, other):
+        if other.__class__ is not self.__class__:
+            return NotImplemented
+        return self._astuple() == other._astuple()
+
+    def __hash__(self):
+        return hash(self._astuple())
+
+    def __repr__(self):
+        return "_FieldMeta(%s)" % ", ".join(
+            "%s=%r" % (name.lstrip("_"), value)
+            for name, value in zip(self.__slots__, self._astuple())
+        )
 
 
 def _qualified_name(meta, parent_module):
@@ -3003,6 +3091,21 @@ def class_name(yang_name):
     return name
 
 
+class _Alias(str):
+    """A class-body alias `Name = Target` of a module-level class. In a
+    split package the .py turns it into a lazy reference when Target is
+    defined in another file (see _py_lines)."""
+
+    indent: str
+    name: str
+    target: str
+
+    def __new__(cls, indent, name, target):
+        line = super().__new__(cls, "%s%s = %s" % (indent, name, target))
+        line.indent, line.name, line.target = indent, name, target
+        return line
+
+
 def _factory_call(factory):
     """An expression building a fresh default from a factory expression
     (a class, `list`, or a `lambda: ...`)."""
@@ -3011,6 +3114,17 @@ def _factory_call(factory):
     if factory.startswith("lambda: "):
         return factory[len("lambda: "):]
     return factory + "()"
+
+
+def _py_lines(lines, lazy=()):
+    """`lines` with the aliases of a name in `lazy` reading it from the
+    file's _LAZY table instead of a module global."""
+    out = []
+    for line in lines:
+        if isinstance(line, _Alias) and line.target in lazy:
+            line = "%s%s = _LAZY[%r]" % (line.indent, line.name, line.target)
+        out.append(line)
+    return out
 
 
 def _class_methods(fields, indent):
@@ -4617,10 +4731,10 @@ class _Emitter:
                 used_class_names.add(child_cname)
                 if self.split_augments:
                     shared = self.emit_block_class(child, child_cname)
-                    self.lines.append("%s%s = %s" % (body_indent, child_cname, shared))
+                    self.lines.append(_Alias(body_indent, child_cname, shared))
                 elif self.dedup_classes:
                     shared = self.emit_shared_class(child, child_cname)
-                    self.lines.append("%s%s = %s" % (body_indent, child_cname, shared))
+                    self.lines.append(_Alias(body_indent, child_cname, shared))
                 else:
                     self.emit_node_class(child, child_cname, body_indent)
                 if child.keyword == "container":
@@ -4773,7 +4887,7 @@ def build_dataclasses(
             files, module_classes = _augment_files(emitter, data_modules)
         else:
             files = [
-                (safe_name(m.arg), [m.arg], lines, []) for m, lines in segments
+                (safe_name(m.arg), [m.arg], lines, {}) for m, lines in segments
             ]
             module_classes = [
                 (class_name(m.arg), safe_name(m.arg)) for m in data_modules
@@ -4792,6 +4906,8 @@ def build_dataclasses(
         "import dataclasses",
         "import typing",
     ]
+    if emitter.with_meta:
+        header.append("import importlib")
     if with_serde:
         header.append("import base64")
     if with_validation:
@@ -4819,7 +4935,7 @@ def build_dataclasses(
     # imports/runtime and the tree classes so forward references resolve and
     # bits classes exist before they are used as field factory defaults.
     # The annotation registry follows them (it may reference _Check).
-    body = emitter.reusable_lines + emitter.annotation_lines + emitter.lines
+    body = _py_lines(emitter.reusable_lines + emitter.annotation_lines + emitter.lines)
     fd.write("\n".join(header + body))
     if not body or body[-1] != "":
         fd.write("\n")
@@ -4827,8 +4943,9 @@ def build_dataclasses(
 
 def _augment_files(emitter, data_modules):
     """--dataclass-split-augments: group the emitted blocks into files, one
-    per owning module, and return ([(stem, module names, lines, import
-    lines)], [(module class name, its file stem)]). Modules whose blocks reference each other
+    per owning module, and return ([(stem, module names, lines, {stem of
+    another file: names imported from it})], [(module class name, its file
+    stem)]). Modules whose blocks reference each other
     in a cycle (A augments into B and B into A) share one file, so the
     imports between files form no cycle. Within a file blocks keep their
     emission order, in which every block follows the blocks it references."""
@@ -4866,14 +4983,10 @@ def _augment_files(emitter, data_modules):
             other = group_of[owner_of[r]][0]
             if other != stem:
                 imports.setdefault(other, set()).add(r)
-    out = []
-    for stem, (members, lines, imports) in files.items():
-        import_lines = []
-        for other in sorted(imports):
-            import_lines.append("from .%s import (" % other)
-            import_lines.extend("    %s," % n for n in sorted(imports[other]))
-            import_lines.append(")")
-        out.append((stem, members, lines, import_lines))
+    out = [
+        (stem, members, lines, imports)
+        for stem, (members, lines, imports) in files.items()
+    ]
     module_classes = [
         (class_name(m.arg), group_of[emitter._module_name(m)][0])
         for m in data_modules
@@ -4896,7 +5009,14 @@ def _write_split_package(
     the same names as a single-file build. (The classic pybind backend's
     --split-class-dir needs no equivalent of _runtime.py only because its
     runtime is the pyangbind.lib dependency; this backend stays
-    stdlib-only.)"""
+    stdlib-only.)
+
+    A class from another file is imported lazily (when the schema
+    metadata, hence _LazyClass, is generated): the file lists it in its
+    ``_LAZY`` table and imports it on first use, through the class-body
+    alias, the field's _FieldMeta.cls or the module ``__getattr__``. So
+    ``import <package>`` imports only the files holding the module
+    classes, and a tree built for a few hierarchies imports only theirs."""
 
     def needed(lines, names):
         return [n for n in names if any(n in line for line in lines)]
@@ -4909,6 +5029,7 @@ def _write_split_package(
                 out.write("\n")
 
     os.makedirs(split_dir, exist_ok=True)
+    lazy_imports = emitter.with_meta  # _LazyClass is part of the runtime
 
     runtime_blocks = []
     if emitter.with_meta:
@@ -4925,6 +5046,7 @@ def _write_split_package(
             '"""Shared runtime for the generated bindings package."""',
             "",
             "import dataclasses",
+            "import importlib",
             "import typing",
         ]
         if with_serde:
@@ -4939,7 +5061,7 @@ def _write_split_package(
 
     # Names generated code may reference from _runtime, private + public.
     runtime_private = (
-        ["_FieldMeta", "_AnnotationDef", "_YANG_ANNOTATIONS"]
+        ["_FieldMeta", "_AnnotationDef", "_YANG_ANNOTATIONS", "_LazyClass"]
         if emitter.with_meta
         else []
     ) + (["_Check", "_YangNode"] if with_validation else [])
@@ -4950,61 +5072,96 @@ def _write_split_package(
         + (["annotate", "annotations"] if emitter.annotation_lines else [])
     )
 
+    def imports_of(lines):
+        """`import` lines for the stdlib modules `lines` reference."""
+        out = []
+        if any("typing." in line for line in lines):
+            out.append("import typing")
+        if any("decimal." in line for line in lines):
+            out.append("import decimal")
+        out.extend(
+            "import %s" % pkg
+            for pkg in sorted(emitter.native_imports | {"ipaddress"})
+            if any(pkg + "." in line for line in lines)
+        )
+        return out
+
     reusable_names = list(emitter.reusable_by_key.values())
     types_lines = emitter.reusable_lines + emitter.annotation_lines
     if types_lines:
-        header = [
+        doc_lines = [
             '"""Reusable types shared by the generated bindings package',
             "(type aliases, bits classes, identityref spelling maps,",
             "the RFC 7952 annotation registry).",
             '"""',
             "",
-            "import typing",
         ]
-        from_runtime = needed(types_lines, runtime_private)
-        if from_runtime:
-            header.append("from ._runtime import %s" % ", ".join(from_runtime))
-        header += [
+        all_lines = [
             "",
             "__all__ = [",
             *("    %r," % n for n in reusable_names),
             "]",
             "",
         ]
-        write("_types.py", header + types_lines)
+        header = doc_lines + imports_of(types_lines)
+        from_runtime = needed(types_lines, runtime_private)
+        if from_runtime:
+            header.append("from ._runtime import %s" % ", ".join(from_runtime))
+        write("_types.py", header + all_lines + types_lines)
 
     stems = {}  # file stem -> YANG module names
-    for stem, names, lines, import_lines in files:
+    for stem, names, lines, imports in files:
         if stem in stems:
             raise ValueError(
                 "YANG modules %r map to the same Python file name %s.py"
                 % (sorted(stems[stem] + names), stem)
             )
         stems[stem] = names
-        header = [
+        doc_lines = [
             '"""Typed bindings for YANG module%s %s."""'
             % ("s" if len(names) > 1 else "", ", ".join("`%s`" % n for n in names)),
             "",
             "from __future__ import annotations",
             "",
         ]
-        if any("typing." in line for line in lines):
-            header.append("import typing")
-        if any("decimal." in line for line in lines):
-            header.append("import decimal")
-        header.extend(
-            "import %s" % pkg
-            for pkg in sorted(emitter.native_imports | {"ipaddress"})
-            if any(pkg + "." in line for line in lines)
-        )
-        from_runtime = needed(lines, runtime_private)
+        imported = {n: other for other in imports for n in imports[other]}
+        lazy = imported if lazy_imports else {}
+        py = _py_lines(lines, lazy)
+
+        header = doc_lines + imports_of(py)
+        from_runtime = needed(py + (["_LazyClass"] if lazy else []), runtime_private)
         if from_runtime:
             header.append("from ._runtime import %s" % ", ".join(from_runtime))
         if reusable_names:
             header.append("from ._types import *  # noqa: F401,F403")
-        header += import_lines
+        if lazy:
+            header += ["", "# classes of other files, imported on first use", "_LAZY = {"]
+            header += [
+                "    %r: _LazyClass('.%s', %r)," % (n, imported[n], n)
+                for n in sorted(imported)
+            ]
+            header += [
+                "}",
+                "",
+                "",
+                "def __getattr__(name):",
+                "    lazy = _LAZY.get(name)",
+                "    if lazy is None:",
+                '        raise AttributeError("module %r has no attribute %r" % (__name__, name))',
+                "    return lazy.resolve()",
+                "",
+                "",
+                "def __dir__():",
+                "    return sorted(set(globals()) | set(_LAZY))",
+            ]
+        else:
+            for other in sorted(imports):
+                header.append("from .%s import (" % other)
+                header.extend("    %s," % n for n in sorted(imports[other]))
+                header.append(")")
         header += ["", ""]
-        write("%s.py" % stem, header + lines)
+
+        write("%s.py" % stem, header + py)
 
     init = doc + [""]
     exported = []

@@ -1233,8 +1233,9 @@ class DataclassMustWhenTests(unittest.TestCase):
 
     def test_opt_out_flag(self):
         bindings = generate("--no-dataclass-must-when", yang_file=self.yang)
-        self.assertNotIn("musts=", bindings._source)
-        self.assertNotIn("whens=", bindings._source)
+        metas = [line for line in bindings._source.splitlines() if "_FieldMeta(" in line]
+        self.assertTrue(metas)
+        self.assertFalse([line for line in metas if "musts=" in line or "whens=" in line])
         tree = bindings.DataclassConstraints()
         Vrf = bindings.DataclassConstraints.Net.Vrf
         tree.net.vrf = [Vrf(name="a", mtu=100)]  # violates the must
@@ -1839,9 +1840,11 @@ class DataclassSplitAugmentsTests(unittest.TestCase):
         )
         self.assertIn("class Root(", sources["dataclass_aug_root.py"])
         self.assertIn("class Alpha(", sources["dataclass_aug_a.py"])
-        # b augments into a's tree: a imports b's class
+        # b augments into a's tree: a refers to b's class, imported lazily
         self.assertIn("class Beta(", sources["dataclass_aug_b.py"])
-        self.assertIn("from .dataclass_aug_b import (\n    Beta,\n)", sources["dataclass_aug_a.py"])
+        self.assertIn("'Beta': _LazyClass('.dataclass_aug_b', 'Beta'),", sources["dataclass_aug_a.py"])
+        self.assertIn("    Beta = _LAZY['Beta']", sources["dataclass_aug_a.py"])
+        self.assertNotIn("from .dataclass_aug_b", sources["dataclass_aug_a.py"])
         self.assertNotIn("from .dataclass_aug", sources["dataclass_aug_b.py"])
         root = pkg.DataclassAugRoot.Root
         self.assertIs(root.Item.Opts, root.Gamma.Opts)  # dedup within b
@@ -1867,6 +1870,37 @@ class DataclassSplitAugmentsTests(unittest.TestCase):
             self.assertEqual(pkg.to_ietf_json(tree), data)
             with self.assertRaises(pkg.YangValidationError):
                 tree.root.gamma.opts.v = 11
+
+    def test_other_files_are_imported_on_first_use(self):
+        pkg, _ = self.build("--dataclass-dedup-classes")
+
+        def loaded(stem):
+            return "%s.%s" % (pkg.__name__, stem) in sys.modules
+
+        self.assertTrue(loaded("dataclass_aug_root"))
+        self.assertFalse(loaded("dataclass_aug_a") or loaded("dataclass_aug_b"))
+        tree = pkg.DataclassAugRoot()
+        tree.root.name = "r"
+        self.assertEqual(pkg.to_ietf_json(tree), {"dataclass-aug-root:root": {"name": "r"}})
+        self.assertNotIn("alpha", vars(tree.root))
+        self.assertFalse(loaded("dataclass_aug_a") or loaded("dataclass_aug_b"))
+        tree.root.alpha.x = 1
+        self.assertTrue(loaded("dataclass_aug_a"))
+        self.assertFalse(loaded("dataclass_aug_b"))
+        Root = type(tree.root)
+        alpha = sys.modules[pkg.__name__ + ".dataclass_aug_a"].Alpha
+        self.assertIs(Root.Alpha, alpha)
+        self.assertIs(type(tree.root.alpha), alpha)
+        self.assertIs(Root._yang_fields["alpha"].cls, alpha)
+        # the module __getattr__ keeps `from <file> import <class>` working
+        root_file = sys.modules[pkg.__name__ + ".dataclass_aug_root"]
+        self.assertIs(root_file.Alpha, alpha)
+        self.assertIn("Gamma", dir(root_file))
+        self.assertFalse(loaded("dataclass_aug_b"))
+        self.assertIs(root_file.Gamma, Root.Gamma)
+        self.assertTrue(loaded("dataclass_aug_b"))
+        with self.assertRaises(AttributeError):
+            root_file.NoSuchClass
 
     def test_needs_split_dir(self):
         proc = subprocess.run(
