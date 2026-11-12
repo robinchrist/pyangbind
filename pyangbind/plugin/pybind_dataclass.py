@@ -1,13 +1,19 @@
-"""pybind-dataclass: emit YANG models as plain, fully type-hinted dataclasses.
+"""pybind-dataclass: emit YANG models as plain, fully type-hinted classes.
 
 An alternative output format to the classic ``pybind`` plugin. Instead of
 pyangbind's dynamic class machinery (``YANGDynClass`` wrappers, properties
 attached via ``__builtin__.property(...)`` at class-build time -- opaque to
-IDEs and type checkers), this emits ordinary ``@dataclasses.dataclass``
-definitions with real type annotations:
+IDEs and type checkers), this emits ordinary classes with real type
+annotations and dataclass-style methods: ``__init__`` (one parameter per
+field, in field order, every one with a default), ``__eq__`` and
+``__repr__``. The methods are written out in the generated source rather
+than made by ``@dataclasses.dataclass``, which builds and exec()s their
+source for every class at each import: for a large schema (Junos, ~15k
+classes) that was 3.2 s of a 3.6 s import, while written-out methods are
+compiled into the .pyc once.
 
-- container      -> nested dataclass, field with ``default_factory``
-- list           -> nested dataclass for the entry, ``list[Entry]`` field
+- container      -> nested class, built by ``__init__``
+- list           -> nested class for the entry, ``list[Entry]`` field
                     (keyed-ness is not enforced; the key leaves are ordinary
                     fields of the entry)
 - leaf           -> ``<type> | None = None``
@@ -22,8 +28,8 @@ definitions with real type annotations:
                     (``bgp``) and module-prefixed (``frr-bgp:bgp``) spelling;
                     every leaf sharing the base identity references the one alias
 - union          -> ``T1 | T2`` of the mapped member types
-- bits           -> module-level reusable dataclass with one ``bool =
-                    False`` field per YANG bit, truthy iff any bit is set;
+- bits           -> module-level reusable class with one ``bool``
+                    field (default False) per YANG bit, truthy iff any bit is set;
                     hoisted (not nested) so it can also be a union member.
                     The YANG default is applied at the field via a factory,
                     not baked into the class, so one class is shared across
@@ -43,7 +49,7 @@ Three features, all ON by default, each with a CLI opt-out flag:
 Validation (disable with ``--no-dataclass-validation``)
     A small (stdlib-only) runtime is embedded in the generated module and
     every generated class validates values *on assignment* (including
-    dataclass ``__init__`` keyword arguments): base-type checks, integer /
+    ``__init__`` arguments): base-type checks, integer /
     decimal ranges (incl. decimal64 fraction-digits), string lengths and
     patterns, enumeration and identityref value sets, bits names, union
     membership. Violations raise ``YangValidationError``. Leaf-list
@@ -82,12 +88,9 @@ Validation (disable with ``--no-dataclass-validation``)
 
 Defaults (disable with ``--no-dataclass-defaults``)
     YANG ``default`` statements (from the leaf itself or its typedef
-    chain) become dataclass field defaults instead of ``None``. Disable
+    chain) become ``__init__`` defaults instead of ``None``. Disable
     this when consumers need "unset leaf is always None" so that
-    falsiness reliably means "not explicitly configured". Field ordering
-    is never a problem either way: *every* generated field has a default
-    (``None``, the YANG default, or a factory), so the dataclass
-    "non-default field follows defaulted field" TypeError cannot occur.
+    falsiness reliably means "not explicitly configured".
 
 Native IP types (disable with ``--no-dataclass-native-ip-types``)
     Leaves whose typedef chain passes through one of the RFC 6991
@@ -206,7 +209,7 @@ Multi-file output (opt-in with ``--dataclass-split-dir DIR``)
     that defines data nodes, holding only that module's tree classes.
     Nothing shared is duplicated -- the embedded runtime is generated
     once into ``_runtime.py`` and every reusable type (Literal aliases,
-    bits dataclasses, identityref spelling maps) once into ``_types.py``
+    bits classes, identityref spelling maps) once into ``_types.py``
     -- and ``__init__.py`` re-exports everything, so ``import <package>``
     exposes exactly the same names as a single-file build. Per-module
     files import from ``._runtime``/``._types`` only, never from each
@@ -1672,8 +1675,8 @@ class _Check:
 
 
 class _YangNode:
-    """Base of every generated dataclass: validates each assignment
-    (dataclass __init__ assigns through __setattr__ too)."""
+    """Base of every generated class: validates each assignment (the
+    generated __init__ assigns through __setattr__ too)."""
 
     _yang_fields: typing.ClassVar[dict] = {}
 
@@ -2982,6 +2985,76 @@ def class_name(yang_name):
     if keyword.iskeyword(name):
         name += "_"
     return name
+
+
+def _factory_call(factory):
+    """An expression building a fresh default from a factory expression
+    (a class, `list`, or a `lambda: ...`)."""
+    if factory == "list":
+        return "[]"
+    if factory.startswith("lambda: "):
+        return factory[len("lambda: "):]
+    return factory + "()"
+
+
+def _class_methods(fields, indent):
+    """Lines of the methods of a generated class (what @dataclass used to
+    generate at import time; written out, they are compiled into the .pyc
+    once instead): __init__ with one parameter per field in field order,
+    __eq__ and __repr__. `fields` holds
+    (name, type text, init kind, expr) tuples:
+
+    - "value": the parameter defaults to `expr` (None or an immutable YANG
+      default), assigned as given
+    - "new": the parameter defaults to None, standing for a fresh `expr`
+      (a list, a bits instance)
+    - "child": a container, `expr` naming its class attribute"""
+    names = {f[0] for f in fields}
+    me = "self"
+    while me in names:
+        me = "_" + me
+    other = "other"
+    while other in names:
+        other = "_" + other
+    inner = indent + "    "
+    out = []
+    params = "".join(
+        ", %s=%s" % (name, expr if kind == "value" else "None")
+        for name, _t, kind, expr in fields
+    )
+    out.append("%sdef __init__(%s%s):" % (indent, me, params))
+    for name, _t, kind, expr in fields:
+        if kind == "value":
+            out.append("%s%s.%s = %s" % (inner, me, name, name))
+        else:  # "new" / "child"
+            if kind == "child":
+                expr = "%s.%s()" % (me, expr)
+            out.append(
+                "%s%s.%s = %s if %s is None else %s" % (inner, me, name, expr, name, name)
+            )
+    if not fields:
+        out.append("%spass" % inner)
+    out.append("")
+    out.append("%sdef __eq__(%s, %s):" % (indent, me, other))
+    out.append("%sif %s.__class__ is not %s.__class__:" % (inner, other, me))
+    out.append("%s    return NotImplemented" % inner)
+    if fields:
+        out.append("%sreturn (%s) == (%s)" % (
+            inner,
+            "".join("%s.%s, " % (me, f[0]) for f in fields).rstrip(),
+            "".join("%s.%s, " % (other, f[0]) for f in fields).rstrip(),
+        ))
+    else:
+        out.append("%sreturn True" % inner)
+    out.append("")
+    out.append("%sdef __repr__(%s):" % (indent, me))
+    out.append("%sreturn '%%s(%s)' %% (%s.__class__.__qualname__%s)" % (
+        inner,
+        ", ".join("%s=%%r" % f[0] for f in fields),
+        me,
+        "".join(", %s.%s" % (me, f[0]) for f in fields),
+    ))
+    return out
 
 
 def _build_identity_values(ctx):
@@ -4332,12 +4405,11 @@ class _Emitter:
         def build(name):
             base = "(_YangNode)" if self.with_validation else ""
             out = [
-                "@dataclasses.dataclass",
                 "class %s%s:" % (name, base),
                 '    """Bits `%s`: one bool per YANG bit; truthy iff any bit is set."""'
                 % label,
             ]
-            out.extend("    %s: bool = False" % bit_fname for bit_fname, _ in bits)
+            out.extend("    %s: bool" % bit_fname for bit_fname, _ in bits)
             if self.with_meta:
                 out.append("")
                 out.append("    _yang_name = %r" % label)
@@ -4350,6 +4422,10 @@ class _Emitter:
                     for bit_fname, bit_yang in bits
                 )
                 out.append("    }")
+            out.append("")
+            out.extend(_class_methods(
+                [(bit_fname, "bool", "value", "False") for bit_fname, _ in bits], "    "
+            ))
             out.append("")
             out.append("    def __bool__(self) -> bool:")
             out.append("        return any(vars(self).values())")
@@ -4379,25 +4455,21 @@ class _Emitter:
         return "lambda: %s(%s)" % (cname, kwargs)
 
     def _emit_leaf(self, child, fname, indent):
+        """Emit the annotation of a leaf / leaf-list field and return its
+        _class_methods field tuple."""
         ann = self.annotation(child.search_one("type"), child)
         scalar_default, factory = (None, None)
         if self.with_defaults:
             scalar_default, factory = self.default_exprs(child, child.search_one("type"))
 
         if child.keyword == "leaf-list":
-            self.lines.append(
-                "%s%s: list[%s] = dataclasses.field(default_factory=%s)"
-                % (indent, fname, ann, factory or "list")
-            )
+            field = (fname, "list[%s]" % ann, "new", _factory_call(factory or "list"))
         elif factory is not None:
-            self.lines.append(
-                "%s%s: %s | None = dataclasses.field(default_factory=%s)"
-                % (indent, fname, ann, factory)
-            )
+            field = (fname, "%s | None" % ann, "new", _factory_call(factory))
         else:
-            self.lines.append(
-                "%s%s: %s | None = %s" % (indent, fname, ann, scalar_default or "None")
-            )
+            field = (fname, "%s | None" % ann, "value", scalar_default or "None")
+        self.lines.append("%s%s: %s" % (indent, fname, field[1]))
+        return field
 
     def emit_shared_class(self, stmt, cname):
         """--dataclass-dedup-classes: emit the class for `stmt` at module
@@ -4412,9 +4484,9 @@ class _Emitter:
             lines = self.lines
         finally:
             self.lines = saved
-        # lines[0:2] are the decorator and the `class` line: the name is not
-        # part of the identity, everything else is
-        body = "\n".join(lines[2:])
+        # lines[0] is the `class` line: the name is not part of the
+        # identity, everything else is
+        body = "\n".join(lines[1:])
         name = self.shared_class_by_body.get(body)
         if name is None:
             # numbered, not "_"-extended like the reusable types: a common
@@ -4429,7 +4501,7 @@ class _Emitter:
             # split mode) and the module classes
             self.reusable_names.add(name)
             self.shared_class_by_body[body] = name
-            lines[1] = lines[1].replace("class %s" % cname, "class %s" % name, 1)
+            lines[0] = lines[0].replace("class %s" % cname, "class %s" % name, 1)
             self.shared_class_lines.extend(lines)
         return name
 
@@ -4453,7 +4525,7 @@ class _Emitter:
         finally:
             self.lines = saved
             self.block_stack.pop()
-        key = (owner, "\n".join(lines[2:]))
+        key = (owner, "\n".join(lines[1:]))
         hit = self.block_by_body.get(key) if self.dedup_classes else None
         if hit is not None:
             name = hit["name"]
@@ -4464,7 +4536,7 @@ class _Emitter:
                 n += 1
                 name = "%s_%d" % (cname, n)
             self.reusable_names.add(name)
-            lines[1] = lines[1].replace("class %s" % cname, "class %s" % name, 1)
+            lines[0] = lines[0].replace("class %s" % cname, "class %s" % name, 1)
             block.update(name=name, lines=lines)
             self.blocks.append(block)
             self.block_by_body[key] = block
@@ -4473,21 +4545,23 @@ class _Emitter:
         return name
 
     def emit_node_class(self, stmt, cname, indent):
-        """Emit a dataclass for a container / list entry / module."""
-        self.lines.append("%s@dataclasses.dataclass" % indent)
+        """Emit a plain class for a container / list entry / module: field
+        annotations, the schema metadata and the methods (_class_methods).
+        The first line is the `class` line (emit_shared_class and
+        emit_block_class rename it); the rest is the class's identity."""
         base = "(_YangNode)" if self.with_validation else ""
         self.lines.append("%sclass %s%s:" % (indent, cname, base))
         body_indent = indent + "    "
-        body_start = len(self.lines)
         self._docstring(stmt, body_indent)
 
         used_class_names = set()
         field_metas = []
+        fields = []  # _class_methods tuples, in field order
         entries, choices = self._flattened_children(stmt)
         # Sibling data nodes may share a local name when they come from
         # different modules (an augment's case leaf may legally shadow a
         # same-named leaf of the target module: names are namespaced per
-        # module, RFC 7950 6.2.1). A python dataclass has one flat
+        # module, RFC 7950 6.2.1). A python class has one flat
         # namespace, so qualify the colliding foreign-module fields with
         # their module name, mirroring RFC 7951's member qualification
         # (same-module child stays bare).
@@ -4526,15 +4600,10 @@ class _Emitter:
                 else:
                     self.emit_node_class(child, child_cname, body_indent)
                 if child.keyword == "container":
-                    self.lines.append(
-                        "%s%s: %s = dataclasses.field(default_factory=%s)"
-                        % (body_indent, fname, child_cname, child_cname)
-                    )
+                    fields.append((fname, child_cname, "child", child_cname))
                 else:
-                    self.lines.append(
-                        "%s%s: list[%s] = dataclasses.field(default_factory=list)"
-                        % (body_indent, fname, child_cname)
-                    )
+                    fields.append((fname, "list[%s]" % child_cname, "new", "[]"))
+                self.lines.append("%s%s: %s" % (body_indent, fname, fields[-1][1]))
                 self.lines.append("")
                 field_metas.append(
                     (fname, self.field_meta_expr(child, case, child_cname, when_stmts))
@@ -4542,7 +4611,8 @@ class _Emitter:
             elif child.keyword in ("anydata", "anyxml"):
                 # opaque: any RFC 7951 JSON value, held and re-emitted
                 # verbatim, never validated
-                self.lines.append("%s%s: typing.Any = None" % (body_indent, fname))
+                fields.append((fname, "typing.Any", "value", "None"))
+                self.lines.append("%s%s: typing.Any" % (body_indent, fname))
                 field_metas.append(
                     (fname, self.field_meta_expr(child, case, when_stmts=when_stmts))
                 )
@@ -4553,22 +4623,17 @@ class _Emitter:
                         child.search_one("type"), resolved, child
                     )
                     if child.keyword == "leaf-list":
-                        self.lines.append(
-                            "%s%s: list[%s] = dataclasses.field(default_factory=list)"
-                            % (body_indent, fname, bits_cname)
-                        )
+                        fields.append((fname, "list[%s]" % bits_cname, "new", "[]"))
                     else:
                         factory = self._bits_default_factory(child, bits_cname)
-                        self.lines.append(
-                            "%s%s: %s = dataclasses.field(default_factory=%s)"
-                            % (body_indent, fname, bits_cname, factory)
-                        )
+                        fields.append((fname, bits_cname, "new", _factory_call(factory)))
+                    self.lines.append("%s%s: %s" % (body_indent, fname, fields[-1][1]))
                     self.lines.append("")
                     field_metas.append(
                         (fname, self.field_meta_expr(child, case, bits_cname, when_stmts))
                     )
                     continue
-                self._emit_leaf(child, fname, body_indent)
+                fields.append(self._emit_leaf(child, fname, body_indent))
                 field_metas.append(
                     (fname, self.field_meta_expr(child, case, when_stmts=when_stmts))
                 )
@@ -4591,8 +4656,8 @@ class _Emitter:
                     self.lines.append("%s    %r: %s," % (body_indent, fname, meta))
                 self.lines.append("%s}" % body_indent)
 
-        if len(self.lines) == body_start:
-            self.lines.append("%spass" % body_indent)
+        self.lines.append("")
+        self.lines.extend(_class_methods(fields, body_indent))
         self.lines.append("")
 
 
@@ -4800,8 +4865,8 @@ def _write_split_package(
     (with --dataclass-split-augments: per module contributing data nodes).
 
     Everything shared lives exactly once: the embedded runtime (metadata
-    dataclass, validation, serde, xpaths) in ``_runtime.py`` and every
-    reusable type (Literal aliases, bits dataclasses, identity maps) in
+    classes, validation, serde, xpaths) in ``_runtime.py`` and every
+    reusable type (Literal aliases, bits classes, identity maps) in
     ``_types.py``. Per-module files hold only that module's tree classes;
     ``__init__.py`` re-exports the lot, so ``import <package>`` exposes
     the same names as a single-file build. (The classic pybind backend's
@@ -4866,11 +4931,10 @@ def _write_split_package(
     if types_lines:
         header = [
             '"""Reusable types shared by the generated bindings package',
-            "(type aliases, bits dataclasses, identityref spelling maps,",
+            "(type aliases, bits classes, identityref spelling maps,",
             "the RFC 7952 annotation registry).",
             '"""',
             "",
-            "import dataclasses",
             "import typing",
         ]
         from_runtime = needed(types_lines, runtime_private)
@@ -4894,12 +4958,11 @@ def _write_split_package(
             )
         stems[stem] = names
         header = [
-            '"""Typed dataclass bindings for YANG module%s %s."""'
+            '"""Typed bindings for YANG module%s %s."""'
             % ("s" if len(names) > 1 else "", ", ".join("`%s`" % n for n in names)),
             "",
             "from __future__ import annotations",
             "",
-            "import dataclasses",
         ]
         if any("typing." in line for line in lines):
             header.append("import typing")

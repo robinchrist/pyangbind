@@ -286,13 +286,33 @@ class DataclassMetadataTests(unittest.TestCase):
         bit = self.bindings.BitsWithDefault._yang_fields["alpha"]
         self.assertEqual((bit.kind, bit.yang_name), ("bit", "alpha"))
 
-    def test_metadata_invisible_to_dataclass_machinery(self):
-        import dataclasses as dc
+    def test_metadata_invisible_to_init_eq_repr(self):
+        import inspect
 
-        field_names = {f.name for f in dc.fields(self.top.Refs)}
-        self.assertNotIn("_yang_fields", field_names)
+        params = inspect.signature(self.top.Refs).parameters
+        self.assertNotIn("_yang_fields", params)
+        self.assertEqual(list(params), list(self.top.Refs._yang_fields))
         # repr/eq untouched by ClassVar metadata
         self.assertEqual(self.top.Refs.Server(), self.top.Refs.Server())
+        self.assertNotIn("_yang", repr(self.top.Refs.Server()))
+
+    def test_plain_classes_with_written_out_methods(self):
+        Server = self.top.Refs.Server
+        self.assertNotIn("dataclasses.dataclass", self.bindings._source.split("class Dataclass")[1])
+        self.assertFalse(hasattr(Server, "__dataclass_fields__"))
+        # positional parameters in field order, as a dataclass __init__
+        a = Server("s1", 80, "tcp")
+        self.assertEqual((a.name, a.port, a.proto), ("s1", 80, "tcp"))
+        self.assertEqual(a, Server(name="s1", port=80, proto="tcp"))
+        self.assertNotEqual(a, Server(name="s1", port=81, proto="tcp"))
+        self.assertNotEqual(a, ("s1", 80, "tcp"))
+        self.assertIsNone(Server.__hash__)  # mutable, like eq=True dataclasses
+        self.assertEqual(repr(a), "Dataclass.Refs.Server(name='s1', port=80, proto='tcp')")
+        with self.assertRaises(self.bindings.YangValidationError):
+            Server(port=-1)  # __init__ assigns through the validating __setattr__
+        with self.assertRaises(TypeError):
+            Server(nmae="s1")
+
 
 
 class DataclassValidateTreeTests(unittest.TestCase):
