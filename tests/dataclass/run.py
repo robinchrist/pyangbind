@@ -313,6 +313,18 @@ class DataclassMetadataTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             Server(nmae="s1")
 
+    def test_containers_are_created_on_first_access(self):
+        top = self.top()
+        self.assertNotIn("refs", vars(top))
+        self.assertEqual(top, self.top())
+        refs = top.refs
+        self.assertIs(top.refs, refs)
+        self.assertIsInstance(refs, self.top.Refs)
+        self.assertEqual(top, self.top())  # an empty container equals an unset one
+        given = self.top.Refs()
+        self.assertIs(self.top(refs=given).refs, given)
+        with self.assertRaises(AttributeError):
+            top.no_such_field
 
 
 class DataclassValidateTreeTests(unittest.TestCase):

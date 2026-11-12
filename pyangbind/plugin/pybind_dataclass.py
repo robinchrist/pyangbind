@@ -12,7 +12,9 @@ source for every class at each import: for a large schema (Junos, ~15k
 classes) that was 3.2 s of a 3.6 s import, while written-out methods are
 compiled into the .pyc once.
 
-- container      -> nested class, built by ``__init__``
+- container      -> nested class; the field is created on first access
+                    (with validation; __init__ builds it otherwise), so
+                    building a node does not build the tree below it
 - list           -> nested class for the entry, ``list[Entry]`` field
                     (keyed-ness is not enforced; the key leaves are ordinary
                     fields of the entry)
@@ -614,12 +616,13 @@ class _XNode:
 
 
 def _xnode_has_data(obj):
-    """YANG data-tree existence of a container instance. The bindings
-    auto-instantiate every container object, so a container exists once
-    it holds data -- or, for presence containers, when mark_present()
-    flagged the instance explicitly (present-but-empty)."""
+    """YANG data-tree existence of a container instance. A container
+    exists once it holds data -- or, for presence containers, when mark_present()
+    flagged the instance explicitly (present-but-empty). Reads the
+    instance __dict__: a container never accessed is unset there and
+    holds no data."""
     for fname, meta in getattr(type(obj), "_yang_fields", {}).items():
-        value = getattr(obj, fname, None)
+        value = obj.__dict__.get(fname)
         if value is None:
             continue
         if meta.kind == "container":
@@ -644,7 +647,7 @@ def _xnode_children(xnode):
     holders = xnode.roots if xnode.roots is not None else [xnode.obj]
     for holder in holders:
         for fname, meta in getattr(type(holder), "_yang_fields", {}).items():
-            value = getattr(holder, fname, None)
+            value = holder.__dict__.get(fname)  # unset container: no data
             if meta.kind == "container":
                 if value is not None and (
                     _xnode_has_data(value)
@@ -1676,11 +1679,24 @@ class _Check:
 
 class _YangNode:
     """Base of every generated class: validates each assignment (the
-    generated __init__ assigns through __setattr__ too)."""
+    generated __init__ assigns through __setattr__ too) and creates a
+    container on first access (__init__ leaves containers unset, so
+    building a node does not build, or import, the whole tree below)."""
 
     _yang_fields: typing.ClassVar[dict] = {}
 
     if not typing.TYPE_CHECKING:
+
+        def __getattr__(self, name):
+            # only reached for names not in the instance __dict__
+            meta = type(self)._yang_fields.get(name)
+            if meta is None or meta.kind != "container":
+                raise AttributeError(
+                    "%r object has no attribute %r" % (type(self).__name__, name)
+                )
+            value = meta.cls()
+            object.__setattr__(self, name, value)
+            return value
 
         def __setattr__(self, name, value):
             meta = self._yang_fields.get(name)
@@ -2400,7 +2416,7 @@ def to_ietf_json(root):
         out = {}
         fields = getattr(type(node), "_yang_fields", {})
         for fname, meta in fields.items():
-            value = getattr(node, fname, None)
+            value = node.__dict__.get(fname)  # unset container: empty
             key = _qualified_name(meta, parent_module)
             if meta.kind == "container":
                 if value is not None:
@@ -2774,7 +2790,7 @@ def data_path(root, node):
 
     def search(current, path, parent_module):
         for fname, meta in getattr(type(current), "_yang_fields", {}).items():
-            value = getattr(current, fname, None)
+            value = current.__dict__.get(fname)  # unset container: empty
             if value is None:
                 continue
             step = "%s/%s" % (path, _qualified_name(meta, parent_module))
@@ -3008,7 +3024,9 @@ def _class_methods(fields, indent):
       default), assigned as given
     - "new": the parameter defaults to None, standing for a fresh `expr`
       (a list, a bits instance)
-    - "child": a container, `expr` naming its class attribute"""
+    - "child": a container built eagerly, `expr` naming its class attribute
+    - "lazy": a container; left unset unless given (_YangNode.__getattr__
+      creates it on first access)"""
     names = {f[0] for f in fields}
     me = "self"
     while me in names:
@@ -3026,12 +3044,15 @@ def _class_methods(fields, indent):
     for name, _t, kind, expr in fields:
         if kind == "value":
             out.append("%s%s.%s = %s" % (inner, me, name, name))
-        else:  # "new" / "child"
+        elif kind in ("new", "child"):
             if kind == "child":
                 expr = "%s.%s()" % (me, expr)
             out.append(
                 "%s%s.%s = %s if %s is None else %s" % (inner, me, name, expr, name, name)
             )
+        else:
+            out.append("%sif %s is not None:" % (inner, name))
+            out.append("%s    %s.%s = %s" % (inner, me, name, name))
     if not fields:
         out.append("%spass" % inner)
     out.append("")
@@ -4557,6 +4578,9 @@ class _Emitter:
         used_class_names = set()
         field_metas = []
         fields = []  # _class_methods tuples, in field order
+        # _YangNode creates a container on first access; without the base
+        # (no validation) __init__ builds every container
+        container_kind = "lazy" if self.with_validation else "child"
         entries, choices = self._flattened_children(stmt)
         # Sibling data nodes may share a local name when they come from
         # different modules (an augment's case leaf may legally shadow a
@@ -4600,7 +4624,7 @@ class _Emitter:
                 else:
                     self.emit_node_class(child, child_cname, body_indent)
                 if child.keyword == "container":
-                    fields.append((fname, child_cname, "child", child_cname))
+                    fields.append((fname, child_cname, container_kind, child_cname))
                 else:
                     fields.append((fname, "list[%s]" % child_cname, "new", "[]"))
                 self.lines.append("%s%s: %s" % (body_indent, fname, fields[-1][1]))
