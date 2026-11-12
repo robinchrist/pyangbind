@@ -1853,6 +1853,12 @@ class DataclassSplitAugmentsTests(unittest.TestCase):
         root = pkg.DataclassAugRoot.Root
         self.assertIs(root.Item.Opts, root.Gamma.Opts)  # dedup within b
 
+    def test_package_exports_the_runtime_api(self):
+        pkg, _ = self.build()
+        for name in ("validate_tree", "to_ietf_json", "from_ietf_json", "mark_present", "is_marked_present"):
+            self.assertIn(name, pkg.__all__)
+            self.assertIs(getattr(pkg, name), getattr(sys.modules[pkg.__name__ + "._runtime"], name))
+
     def test_identity_bases_reach_the_runtime(self):
         _, sources = self.build()
         self.assertIn("_YANG_IDENTITY_BASES.update({", sources["_runtime.py"])

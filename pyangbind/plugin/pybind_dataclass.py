@@ -5162,6 +5162,7 @@ def _write_split_package(
     ) + (["_Check", "_YangNode"] if with_validation else [])
     runtime_public = (
         (["YangValidationError", "validate_tree"] if with_validation else [])
+        + (["mark_present", "is_marked_present"] if emitter.with_meta else [])
         + (["to_ietf_json", "from_ietf_json"] if with_serde else [])
         + (["data_path"] if with_xpaths else [])
         + (["annotate", "annotations"] if emitter.annotation_lines else [])
